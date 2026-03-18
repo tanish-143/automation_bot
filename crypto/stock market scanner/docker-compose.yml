@@ -1,0 +1,159 @@
+# ═══════════════════════════════════════════════════════════════════════
+# Market Scanner — Local Development Stack
+# Usage:
+#   cp .env.example .env          # fill in secrets
+#   docker compose up -d          # start everything
+#   docker compose logs -f api    # tail API logs
+# ═══════════════════════════════════════════════════════════════════════
+
+services:
+  # ── TimescaleDB ──────────────────────────────────────────────────────
+  db:
+    image: timescale/timescaledb:latest-pg16
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-scanner}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-scanner}
+      POSTGRES_DB: ${POSTGRES_DB:-scanner}
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/home/postgres/pgdata/data
+      - ./schema:/docker-entrypoint-initdb.d:ro   # auto-run 001/002 on first boot
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U scanner"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # ── Redis ────────────────────────────────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # ── FastAPI Backend ──────────────────────────────────────────────────
+  api:
+    build:
+      context: .
+      target: backend
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      SCANNER_DATABASE_URL: postgresql+asyncpg://scanner:scanner@db:5432/scanner
+      SCANNER_DATABASE_URL_SYNC: postgresql://scanner:scanner@db:5432/scanner
+      SCANNER_REDIS_URL: redis://redis:6379/0
+    ports:
+      - "8000:8000"
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    command: >
+      uvicorn backend.api:app
+        --host 0.0.0.0 --port 8000
+        --reload --reload-dir /app/backend
+    volumes:
+      - ./backend:/app/backend:ro    # hot-reload in dev
+      - ./crypto:/app/crypto:ro
+
+  # ── Celery Worker (scan + ingest tasks) ──────────────────────────────
+  worker:
+    build:
+      context: .
+      target: backend
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      SCANNER_DATABASE_URL: postgresql+asyncpg://scanner:scanner@db:5432/scanner
+      SCANNER_DATABASE_URL_SYNC: postgresql://scanner:scanner@db:5432/scanner
+      SCANNER_REDIS_URL: redis://redis:6379/0
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    command: >
+      celery -A backend.workers:celery_app worker
+        --loglevel=info
+        --concurrency=4
+        --max-tasks-per-child=200
+    volumes:
+      - ./backend:/app/backend:ro
+      - ./crypto:/app/crypto:ro
+
+  # ── Celery Beat (scheduler) ─────────────────────────────────────────
+  beat:
+    build:
+      context: .
+      target: backend
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      SCANNER_DATABASE_URL: postgresql+asyncpg://scanner:scanner@db:5432/scanner
+      SCANNER_DATABASE_URL_SYNC: postgresql://scanner:scanner@db:5432/scanner
+      SCANNER_REDIS_URL: redis://redis:6379/0
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    command: >
+      celery -A backend.workers:celery_app beat
+        --loglevel=info
+    volumes:
+      - ./backend:/app/backend:ro
+      - ./crypto:/app/crypto:ro
+
+  # ── WebSocket Ingestion (long-running async process) ─────────────────
+  ws-ingest:
+    build:
+      context: .
+      target: backend
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      SCANNER_DATABASE_URL: postgresql+asyncpg://scanner:scanner@db:5432/scanner
+      SCANNER_DATABASE_URL_SYNC: postgresql://scanner:scanner@db:5432/scanner
+      SCANNER_REDIS_URL: redis://redis:6379/0
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    command: >
+      python -m backend.ws_manager
+    volumes:
+      - ./backend:/app/backend:ro
+      - ./crypto:/app/crypto:ro
+
+  # ── Frontend (Vite dev server) ───────────────────────────────────────
+  frontend:
+    image: node:22-alpine
+    working_dir: /app
+    restart: unless-stopped
+    ports:
+      - "5173:5173"
+    environment:
+      VITE_API_BASE: http://localhost:8000
+      VITE_WS_URL: ws://localhost:8000/ws/scanner
+    depends_on:
+      - api
+    command: sh -c "npm install && npm run dev -- --host 0.0.0.0"
+    volumes:
+      - ./frontend:/app
+      - frontend_node_modules:/app/node_modules
+
+volumes:
+  pgdata:
+  redisdata:
+  frontend_node_modules:

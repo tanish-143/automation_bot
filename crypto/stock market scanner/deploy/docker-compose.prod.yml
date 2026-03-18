@@ -1,0 +1,112 @@
+# ═══════════════════════════════════════════════════════════════════════
+# Docker Compose — Production-like deployment for workers on a VM
+# Run on an EC2/GCE instance alongside managed DB and Redis.
+#
+# Usage:
+#   scp docker-compose.prod.yml server:~/scanner/
+#   ssh server "cd ~/scanner && docker compose -f docker-compose.prod.yml up -d"
+# ═══════════════════════════════════════════════════════════════════════
+
+services:
+  # ── Celery Workers (horizontal scaling) ──────────────────────────────
+  worker-0:
+    image: ghcr.io/OWNER/automation_bot/scanner:latest
+    restart: always
+    env_file: .env
+    environment:
+      WORKER_ID: "0"
+      TOTAL_WORKERS: "4"
+    command: >
+      celery -A backend.workers:celery_app worker
+        --loglevel=info
+        --concurrency=4
+        --max-tasks-per-child=200
+        --hostname=worker-0@%h
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+          cpus: "1"
+
+  worker-1:
+    image: ghcr.io/OWNER/automation_bot/scanner:latest
+    restart: always
+    env_file: .env
+    environment:
+      WORKER_ID: "1"
+      TOTAL_WORKERS: "4"
+    command: >
+      celery -A backend.workers:celery_app worker
+        --loglevel=info
+        --concurrency=4
+        --max-tasks-per-child=200
+        --hostname=worker-1@%h
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+          cpus: "1"
+
+  worker-2:
+    image: ghcr.io/OWNER/automation_bot/scanner:latest
+    restart: always
+    env_file: .env
+    environment:
+      WORKER_ID: "2"
+      TOTAL_WORKERS: "4"
+    command: >
+      celery -A backend.workers:celery_app worker
+        --loglevel=info
+        --concurrency=4
+        --max-tasks-per-child=200
+        --hostname=worker-2@%h
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+          cpus: "1"
+
+  worker-3:
+    image: ghcr.io/OWNER/automation_bot/scanner:latest
+    restart: always
+    env_file: .env
+    environment:
+      WORKER_ID: "3"
+      TOTAL_WORKERS: "4"
+    command: >
+      celery -A backend.workers:celery_app worker
+        --loglevel=info
+        --concurrency=4
+        --max-tasks-per-child=200
+        --hostname=worker-3@%h
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+          cpus: "1"
+
+  # ── Beat (single instance only!) ─────────────────────────────────────
+  beat:
+    image: ghcr.io/OWNER/automation_bot/scanner:latest
+    restart: always
+    env_file: .env
+    command: >
+      celery -A backend.workers:celery_app beat
+        --loglevel=info
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+          cpus: "0.25"
+
+  # ── WebSocket Ingestion (long-running, single instance) ──────────────
+  ws-ingest:
+    image: ghcr.io/OWNER/automation_bot/scanner:latest
+    restart: always
+    env_file: .env
+    command: python -m backend.ws_manager
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+          cpus: "0.5"

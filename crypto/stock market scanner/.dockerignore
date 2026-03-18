@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+node_modules/
+frontend/dist/
+frontend/node_modules/
+.env
+*.log
+.vscode/
+.idea/

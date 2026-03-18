@@ -1,0 +1,86 @@
+# ═══════════════════════════════════════════════════════════════════════
+# Market Scanner — Deployment Architecture
+# ═══════════════════════════════════════════════════════════════════════
+#
+# Production topology (GCP — adapt for AWS by swapping service names):
+#
+# ┌─────────────────────────────────────────────────────────────────────┐
+# │                        Vercel / Cloud CDN                          │
+# │                    (React SPA — frontend/dist)                     │
+# └─────────────────────────┬───────────────────────────────────────────┘
+#                           │ HTTPS
+# ┌─────────────────────────▼───────────────────────────────────────────┐
+# │              Cloud Run / ECS  (API — autoscale 1→10)               │
+# │         uvicorn backend.api:app --workers 2 --port 8000            │
+# └───┬────────────────┬────────────────┬───────────────────────────────┘
+#     │ asyncpg        │ redis          │ WS
+# ┌───▼──────┐   ┌────▼─────┐   ┌─────▼──────────────────────────────┐
+# │ Cloud SQL│   │ Memorystore│  │ Compute Engine / GKE               │
+# │ (Timescale│  │ (Redis)   │  │  ├── celery worker ×4              │
+# │  DB)     │   │           │  │  ├── celery beat ×1                │
+# │          │   │           │  │  └── ws_manager ×1 (Binance WS)   │
+# └──────────┘   └───────────┘  └────────────────────────────────────┘
+#
+# ═══════════════════════════════════════════════════════════════════════
+# AWS equivalents:
+#   Cloud Run     → ECS Fargate / App Runner
+#   Cloud SQL     → RDS PostgreSQL + TimescaleDB AMI
+#   Memorystore   → ElastiCache Redis
+#   GKE           → EKS / EC2 with docker-compose
+#   Secret Manager→ AWS Secrets Manager / SSM Parameter Store
+# ═══════════════════════════════════════════════════════════════════════
+
+# ── GCP Cloud Run service YAML ──────────────────────────────────────
+
+apiVersion: serving.knative.dev/v1
+kind: Service
+metadata:
+  name: scanner-api
+  labels:
+    cloud.googleapis.com/location: us-central1
+spec:
+  template:
+    metadata:
+      annotations:
+        autoscaling.knative.dev/minScale: "1"
+        autoscaling.knative.dev/maxScale: "10"
+        run.googleapis.com/cpu-throttling: "false"     # always-on CPU
+        run.googleapis.com/startup-cpu-boost: "true"
+    spec:
+      containerConcurrency: 80
+      timeoutSeconds: 300
+      containers:
+        - image: ghcr.io/OWNER/automation_bot/scanner:latest
+          ports:
+            - containerPort: 8000
+          resources:
+            limits:
+              memory: 1Gi
+              cpu: "2"
+          env:
+            - name: SCANNER_ENV
+              value: production
+            - name: SCANNER_DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: scanner-db-url
+                  key: latest
+            - name: SCANNER_REDIS_URL
+              valueFrom:
+                secretKeyRef:
+                  name: scanner-redis-url
+                  key: latest
+            - name: SCANNER_CORS_ORIGINS
+              value: '["https://scanner.yourdomain.com"]'
+          startupProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            failureThreshold: 10
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            periodSeconds: 30
