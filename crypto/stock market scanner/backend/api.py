@@ -55,6 +55,7 @@ class SessionFilter(str, Enum):
 
 
 class TopMoverItem(BaseModel):
+    symbol_id: int
     symbol: str
     exchange: str
     asset_class: str
@@ -186,7 +187,7 @@ async def get_top_movers(
 
     where = " AND ".join(conditions)
     query = text(f"""
-        SELECT symbol, exchange, asset_class, current_price,
+        SELECT symbol_id, symbol, exchange, asset_class, current_price,
                price_change_pct_24h, volume_24h, volume_ratio,
                realized_volatility, volatility_pctile AS volatility_percentile,
                composite_score
@@ -220,13 +221,13 @@ async def get_alerts(
 
     query = text("""
         SELECT a.alert_id, a.ts, s.symbol, s.exchange,
-               a.rule::TEXT, a.status::TEXT,
+               CAST(a.rule AS TEXT) AS rule, CAST(a.status AS TEXT) AS status,
                a.trigger_price, a.trigger_volume_ratio,
                a.trigger_volatility, a.message
         FROM alerts a
         JOIN symbols s ON s.symbol_id = a.symbol_id
         WHERE a.user_id = :uid
-          AND a.status = :st::alert_status
+          AND a.status = CAST(:st AS alert_status)
           AND a.ts >= NOW() - make_interval(hours => :hrs)
         ORDER BY a.ts DESC
         LIMIT :lim
@@ -256,7 +257,7 @@ async def save_rule(
              min_price_change_pct, max_spread_bps, custom_expression, is_enabled,
              created_at, updated_at)
         VALUES
-            (:uid, :sid, :rule::alert_rule, :mvr, :mv, :mpc, :msb, :ce, :ie, NOW(), NOW())
+            (:uid, :sid, CAST(:rule AS alert_rule), :mvr, :mv, :mpc, :msb, :ce, :ie, NOW(), NOW())
         ON CONFLICT (user_id, symbol_id, rule) DO UPDATE SET
             min_volume_ratio     = EXCLUDED.min_volume_ratio,
             min_volatility       = EXCLUDED.min_volatility,

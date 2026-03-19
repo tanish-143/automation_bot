@@ -22,15 +22,13 @@ export interface SymbolRow {
 
 export interface AlertItem {
   alert_id: number;
-  symbol_id: number;
-  fired_at: string;
+  ts: string;
   symbol: string;
   exchange: string;
-  rule_name: string;
+  rule: string;
   status: string;
-  composite_score: number | null;
-  volume_ratio: number | null;
   trigger_price: number | null;
+  trigger_volume_ratio: number | null;
   trigger_volatility: number | null;
   message: string | null;
 }
