@@ -14,18 +14,18 @@ import type { AlertItem } from '../../types/scanner';
 
 const RULE_COLORS: Record<string, string> = {
   volume_spike: 'text-blue-400',
-  volatility_anomaly: 'text-amber-400',
-  combined: 'text-rose-400',
-  session_activity: 'text-purple-400',
-  composite: 'text-emerald-400',
+  volatility_breakout: 'text-amber-400',
+  spread_widening: 'text-rose-400',
+  price_change_pct: 'text-purple-400',
+  custom: 'text-emerald-400',
 };
 
 const RULE_ICONS: Record<string, string> = {
   volume_spike: '📈',
-  volatility_anomaly: '🌊',
-  combined: '⚡',
-  session_activity: '🕐',
-  composite: '🏆',
+  volatility_breakout: '🌊',
+  spread_widening: '⚡',
+  price_change_pct: '🕐',
+  custom: '🏆',
 };
 
 function formatTime(iso: string): string {
@@ -34,11 +34,11 @@ function formatTime(iso: string): string {
 }
 
 function exportCsv(alerts: AlertItem[]) {
-  const header = 'time,symbol,rule,score,volume_ratio,message\n';
+  const header = 'time,symbol,rule,volume_ratio,message\n';
   const rows = alerts
     .map(
       (a) =>
-        `${a.fired_at},${a.symbol},${a.rule_name},${a.composite_score ?? ''},${a.volume_ratio ?? ''},${(a.message ?? '').replace(/,/g, ';')}`,
+        `${a.ts},${a.symbol},${a.rule},${a.trigger_volume_ratio ?? ''},${(a.message ?? '').replace(/,/g, ';')}`,
     )
     .join('\n');
   const blob = new Blob([header + rows], { type: 'text/csv' });
@@ -52,7 +52,6 @@ function exportCsv(alerts: AlertItem[]) {
 
 export function AlertsFeed() {
   const alerts = useStore((s) => s.alerts);
-  const openDetail = useStore((s) => s.openDetail);
   const scrollRef = useRef<HTMLDivElement>(null);
 
   // Auto-scroll on new alerts
@@ -87,7 +86,7 @@ export function AlertsFeed() {
           <div className="text-zinc-600 text-xs text-center mt-8">No alerts yet</div>
         )}
         {visible.map((alert, i) => (
-          <AlertRow key={`${alert.fired_at}-${alert.symbol}-${i}`} alert={alert} onClick={() => openDetail(alert.symbol_id)} />
+          <AlertRow key={`${alert.alert_id}-${i}`} alert={alert} onClick={() => {}} />
         ))}
       </div>
     </div>
@@ -95,8 +94,8 @@ export function AlertsFeed() {
 }
 
 function AlertRow({ alert, onClick }: { alert: AlertItem; onClick: () => void }) {
-  const colorClass = RULE_COLORS[alert.rule_name] ?? 'text-zinc-400';
-  const icon = RULE_ICONS[alert.rule_name] ?? '🔔';
+  const colorClass = RULE_COLORS[alert.rule] ?? 'text-zinc-400';
+  const icon = RULE_ICONS[alert.rule] ?? '🔔';
 
   return (
     <button
@@ -109,9 +108,9 @@ function AlertRow({ alert, onClick }: { alert: AlertItem; onClick: () => void })
           <span className="text-xs font-bold text-zinc-200 group-hover:text-white">
             {alert.symbol}
           </span>
-          <span className={`text-[10px] font-mono ${colorClass}`}>{alert.rule_name}</span>
+          <span className={`text-[10px] font-mono ${colorClass}`}>{alert.rule}</span>
           <span className="text-[10px] text-zinc-600 ml-auto whitespace-nowrap">
-            {formatTime(alert.fired_at)}
+            {formatTime(alert.ts)}
           </span>
         </div>
         {alert.message && (

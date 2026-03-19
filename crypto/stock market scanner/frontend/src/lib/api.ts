@@ -17,7 +17,7 @@ export const api = {
     get<import('../types/scanner').SymbolRow[]>('/scan/top-movers', params),
 
   alerts: (params: Record<string, string | number> = {}) =>
-    get<import('../types/scanner').AlertItem[]>('/scan/alerts', params),
+    get<import('../types/scanner').AlertItem[]>('/scan/alerts', { user_id: 3, ...params }),
 
   snapshot: (symbolId: number, hours = 24) =>
     get<import('../types/scanner').SnapshotPoint[]>(`/scan/snapshot/${symbolId}`, { hours }),
