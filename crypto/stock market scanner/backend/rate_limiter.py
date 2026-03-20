@@ -54,7 +54,7 @@ class BinanceRateLimiter:
     def __init__(
         self,
         redis: aioredis.Redis,
-        max_weight_per_min: int = settings.binance_rate_limit_per_min,
+        max_weight_per_min: int = 1200,
         window_seconds: int = 60,
     ):
         self._redis = redis

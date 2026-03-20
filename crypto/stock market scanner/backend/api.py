@@ -123,8 +123,7 @@ class RuleResponse(BaseModel):
 # ─── Endpoints ────────────────────────────────────────────────────────────────
 
 @app.get("/health")
-async def health(db: AsyncSession = Depends(get_db)):
-    await db.execute(text("SELECT 1"))
+async def health():
     return {"status": "ok", "ts": datetime.now(timezone.utc).isoformat()}
 
 

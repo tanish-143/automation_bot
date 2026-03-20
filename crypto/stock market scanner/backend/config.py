@@ -2,7 +2,11 @@
 Centralised configuration — loaded from environment variables.
 """
 
+from pathlib import Path
+
 from pydantic_settings import BaseSettings
+
+_ENV_FILE = Path(__file__).resolve().parent.parent / ".env"
 
 
 class Settings(BaseSettings):
@@ -54,7 +58,7 @@ class Settings(BaseSettings):
     api_port: int = 8000
     cors_origins: list[str] = ["http://localhost:3000"]
 
-    model_config = {"env_prefix": "SCANNER_", "env_file": ".env", "extra": "ignore"}
+    model_config = {"env_prefix": "SCANNER_", "env_file": str(_ENV_FILE), "extra": "ignore"}
 
 
 settings = Settings()
