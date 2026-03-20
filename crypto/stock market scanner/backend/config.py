@@ -45,12 +45,16 @@ class Settings(BaseSettings):
     smtp_password: str = ""
     smtp_from: str = "scanner@example.com"
 
+    # ── Groq AI ──
+    groq_api_key: str = ""
+    groq_model: str = "llama-3.3-70b-versatile"
+
     # ── API ──
     api_host: str = "0.0.0.0"
     api_port: int = 8000
     cors_origins: list[str] = ["http://localhost:3000"]
 
-    model_config = {"env_prefix": "SCANNER_", "env_file": ".env"}
+    model_config = {"env_prefix": "SCANNER_", "env_file": ".env", "extra": "ignore"}
 
 
 settings = Settings()

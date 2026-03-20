@@ -15,6 +15,7 @@ import { ScannerTable } from './components/scanner/ScannerTable';
 import { Heatmap } from './components/heatmap/Heatmap';
 import { AlertsFeed } from './components/alerts/AlertsFeed';
 import { DetailModal } from './components/detail/DetailModal';
+import { AiTradeSetup } from './components/ai/AiTradeSetup';
 
 function App() {
   const setSymbols = useStore((s) => s.setSymbols);
@@ -27,6 +28,7 @@ function App() {
   const [alertsOpen, setAlertsOpen] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
   const [lastUpdated, setLastUpdated] = useState<Date | null>(null);
+  const [aiOpen, setAiOpen] = useState(false);
 
   // Connect WebSocket
   useWebSocket();
@@ -86,6 +88,19 @@ function App() {
           </div>
 
           <div className="flex items-center gap-2">
+            {/* AI Trade Setup button */}
+            <button
+              onClick={() => setAiOpen(true)}
+              className="flex items-center gap-1.5 text-xs px-3 py-1.5 rounded-md
+                bg-purple-600/20 text-purple-300 border border-purple-500/30
+                hover:bg-purple-600/30 hover:border-purple-500/50 hover:text-purple-200
+                transition-all duration-200 active:scale-95"
+              title="AI Trade Setup Analysis (Groq)"
+            >
+              <span className="text-sm">🤖</span>
+              AI Setup
+            </button>
+
             {/* Refresh button */}
             <button
               onClick={handleRefresh}
@@ -175,6 +190,9 @@ function App() {
 
       {/* Detail modal */}
       <DetailModal />
+
+      {/* AI Trade Setup modal */}
+      <AiTradeSetup open={aiOpen} onClose={() => setAiOpen(false)} />
     </div>
   );
 }

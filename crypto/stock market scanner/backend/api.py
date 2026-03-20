@@ -388,3 +388,65 @@ async def get_live_prices():
         })
 
     return results
+
+
+# ─── AI Trade Setup Analysis (Groq) ──────────────────────────────────────────
+
+@app.get("/scan/ai-analysis")
+async def get_ai_analysis():
+    """
+    Fetch live prices from CoinGecko, send to Groq AI,
+    and return markdown trade setup analysis.
+    """
+    import httpx
+    from groq_ai import analyze_trade_setup
+
+    if not settings.groq_api_key:
+        raise HTTPException(503, "Groq API key not configured")
+
+    # Step 1: Fetch fresh prices
+    coin_ids = ",".join(SYMBOL_TO_COINGECKO.values())
+    headers = {}
+    if settings.coingecko_api_key:
+        headers["x-cg-demo-api-key"] = settings.coingecko_api_key
+
+    try:
+        async with httpx.AsyncClient() as client:
+            resp = await client.get(
+                f"{settings.coingecko_rest_base}/coins/markets",
+                params={
+                    "vs_currency": "usd",
+                    "ids": coin_ids,
+                    "order": "market_cap_desc",
+                    "per_page": 50,
+                    "page": 1,
+                    "sparkline": "false",
+                    "price_change_percentage": "24h",
+                },
+                headers=headers,
+                timeout=15.0,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+    except Exception as e:
+        raise HTTPException(502, f"CoinGecko fetch failed: {e}")
+
+    # Step 2: Map to our format
+    prices = []
+    for coin in data:
+        cg_id = coin.get("id", "")
+        our_symbol = COINGECKO_TO_SYMBOL.get(cg_id)
+        if not our_symbol:
+            continue
+        prices.append({
+            "symbol": our_symbol,
+            "current_price": coin.get("current_price") or 0,
+            "price_change_pct_24h": coin.get("price_change_percentage_24h") or 0,
+            "volume_24h": coin.get("total_volume") or 0,
+            "volume_ratio": 0,  # Not available from CoinGecko directly
+        })
+
+    # Step 3: Send to Groq AI
+    analysis = await analyze_trade_setup(prices)
+
+    return {"analysis": analysis, "coin_count": len(prices)}

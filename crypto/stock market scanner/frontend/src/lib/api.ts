@@ -38,6 +38,8 @@ export const api = {
 
   livePrices: () => get<LivePrice[]>('/scan/live-prices'),
 
+  aiAnalysis: () => get<{ analysis: string; coin_count: number }>('/scan/ai-analysis'),
+
   saveRule: async (userId: number, body: Record<string, unknown>) => {
     const res = await fetch(`${API}/scan/rules?user_id=${userId}`, {
       method: 'POST',
