@@ -12,6 +12,20 @@ async function get<T>(path: string, params?: Record<string, string | number>): P
   return res.json();
 }
 
+export interface LivePrice {
+  symbol: string;
+  current_price: number;
+  price_change_pct_24h: number;
+  volume_24h: number;
+  high_24h: number;
+  low_24h: number;
+  market_cap: number;
+  market_cap_rank: number | null;
+  sparkline: number[];
+  image: string;
+  last_updated: string;
+}
+
 export const api = {
   topMovers: (params: Record<string, string | number>) =>
     get<import('../types/scanner').SymbolRow[]>('/scan/top-movers', params),
@@ -21,6 +35,8 @@ export const api = {
 
   snapshot: (symbolId: number, hours = 24) =>
     get<import('../types/scanner').SnapshotPoint[]>(`/scan/snapshot/${symbolId}`, { hours }),
+
+  livePrices: () => get<LivePrice[]>('/scan/live-prices'),
 
   saveRule: async (userId: number, body: Record<string, unknown>) => {
     const res = await fetch(`${API}/scan/rules?user_id=${userId}`, {

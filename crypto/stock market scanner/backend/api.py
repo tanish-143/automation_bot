@@ -307,3 +307,84 @@ async def get_snapshot_history(
     """)
     result = await db.execute(query, {"sid": symbol_id, "hrs": hours})
     return [dict(r._mapping) for r in result.all()]
+
+
+# ─── Live CoinGecko prices (bypass DB for instant refresh) ────────────────────
+
+SYMBOL_TO_COINGECKO: dict[str, str] = {
+    "BTC/USDT": "bitcoin",
+    "ETH/USDT": "ethereum",
+    "SOL/USDT": "solana",
+    "BNB/USDT": "binancecoin",
+    "XRP/USDT": "ripple",
+    "ADA/USDT": "cardano",
+    "DOGE/USDT": "dogecoin",
+    "AVAX/USDT": "avalanche-2",
+    "DOT/USDT": "polkadot",
+    "MATIC/USDT": "matic-network",
+    "LINK/USDT": "chainlink",
+    "UNI/USDT": "uniswap",
+    "ATOM/USDT": "cosmos",
+    "LTC/USDT": "litecoin",
+    "FIL/USDT": "filecoin",
+}
+COINGECKO_TO_SYMBOL: dict[str, str] = {v: k for k, v in SYMBOL_TO_COINGECKO.items()}
+
+
+@app.get("/scan/live-prices")
+async def get_live_prices():
+    """
+    Fetch real-time prices directly from CoinGecko API.
+    Used by the frontend refresh button for instant data.
+    """
+    import httpx
+
+    coin_ids = ",".join(SYMBOL_TO_COINGECKO.values())
+    headers = {}
+    if settings.coingecko_api_key:
+        headers["x-cg-demo-api-key"] = settings.coingecko_api_key
+
+    async with httpx.AsyncClient() as client:
+        resp = await client.get(
+            f"{settings.coingecko_rest_base}/coins/markets",
+            params={
+                "vs_currency": "usd",
+                "ids": coin_ids,
+                "order": "market_cap_desc",
+                "per_page": 50,
+                "page": 1,
+                "sparkline": "true",
+                "price_change_percentage": "24h",
+            },
+            headers=headers,
+            timeout=15.0,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+
+    results = []
+    for coin in data:
+        cg_id = coin.get("id", "")
+        our_symbol = COINGECKO_TO_SYMBOL.get(cg_id)
+        if not our_symbol:
+            continue
+
+        sparkline_data = coin.get("sparkline_in_7d", {}).get("price", [])
+        # Take last 24 points for sparkline
+        sparkline_24h = sparkline_data[-24:] if len(sparkline_data) >= 24 else sparkline_data
+
+        results.append({
+            "symbol": our_symbol,
+            "current_price": coin.get("current_price") or 0,
+            "price_change_pct_24h": coin.get("price_change_percentage_24h") or 0,
+            "volume_24h": coin.get("total_volume") or 0,
+            "high_24h": coin.get("high_24h") or 0,
+            "low_24h": coin.get("low_24h") or 0,
+            "market_cap": coin.get("market_cap") or 0,
+            "market_cap_rank": coin.get("market_cap_rank"),
+            "sparkline": sparkline_24h,
+            "image": coin.get("image", ""),
+            "last_updated": coin.get("last_updated", ""),
+        })
+
+    return results

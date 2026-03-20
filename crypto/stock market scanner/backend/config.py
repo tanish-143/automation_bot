@@ -17,9 +17,10 @@ class Settings(BaseSettings):
     # ── Redis (Celery broker + result backend + cache) ──
     redis_url: str = "redis://localhost:6379/0"
 
-    # ── CoinGecko REST API (free, no key required) ──
+    # ── CoinGecko REST API (Demo key) ──
     coingecko_rest_base: str = "https://api.coingecko.com/api/v3"
-    coingecko_rate_limit_per_min: int = 30  # free tier: ~10-30 calls/min
+    coingecko_api_key: str = ""  # Demo API key (x-cg-demo-api-key header)
+    coingecko_rate_limit_per_min: int = 30  # demo tier: ~30 calls/min
 
     # ── CoinCap WebSocket (free, no key required) ──
     coincap_ws_url: str = "wss://ws.coincap.io/prices?assets=ALL"

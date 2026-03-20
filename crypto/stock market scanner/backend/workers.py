@@ -12,7 +12,7 @@ Job structure:
   │  Each task is idempotent — safe to retry on failure.             │
   └──────────────────────────────────────────────────────────────────┘
 
-Data source: CoinGecko free API (no key required, ~30 calls/min).
+Data source: CoinGecko Demo API (key sent via x-cg-demo-api-key header).
 """
 
 from __future__ import annotations
@@ -98,8 +98,8 @@ MIN_REQUEST_GAP = 2.5  # seconds between CoinGecko requests (free tier safe)
 
 def _coingecko_get(path: str, params: dict | None = None) -> dict | list:
     """
-    GET request to CoinGecko free API with rate limiting and retry.
-    Free tier: ~10-30 requests/minute, no API key needed.
+    GET request to CoinGecko Demo API with rate limiting and retry.
+    Sends API key via x-cg-demo-api-key header when configured.
     """
     import httpx
     global _last_request_time
@@ -109,11 +109,14 @@ def _coingecko_get(path: str, params: dict | None = None) -> dict | list:
         time.sleep(MIN_REQUEST_GAP - elapsed)
 
     url = f"{settings.coingecko_rest_base}{path}"
+    headers = {}
+    if settings.coingecko_api_key:
+        headers["x-cg-demo-api-key"] = settings.coingecko_api_key
 
     for attempt in range(3):
         try:
             _last_request_time = time.monotonic()
-            resp = httpx.get(url, params=params, timeout=15.0)
+            resp = httpx.get(url, params=params, headers=headers, timeout=15.0)
 
             if resp.status_code == 429:
                 wait = int(resp.headers.get("Retry-After", 30))
