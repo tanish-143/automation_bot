@@ -19,7 +19,6 @@ import { AiTradeSetup } from './components/ai/AiTradeSetup';
 
 function App() {
   const setSymbols = useStore((s) => s.setSymbols);
-  const batchUpdateSymbols = useStore((s) => s.batchUpdateSymbols);
   const setAlerts = useStore((s) => s.setAlerts);
   const wsConnected = useStore((s) => s.wsConnected);
   const alerts = useStore((s) => s.alerts);
@@ -33,35 +32,60 @@ function App() {
   // Connect WebSocket
   useWebSocket();
 
-  // Initial data fetch
+  // Initial data fetch — try DB-backed top-movers first, fall back to live CoinGecko prices
   useEffect(() => {
-    api.topMovers({}).then(setSymbols).catch(console.error);
-    api.alerts({}).then(setAlerts).catch(console.error);
+    api.topMovers({}).then(setSymbols).catch(() => {
+      // DB unavailable — seed store from live CoinGecko data
+      api.livePrices().then((prices) => {
+        const rows = prices.map((p, i) => ({
+          symbol_id: i + 1,
+          symbol: p.symbol,
+          exchange: 'coingecko',
+          asset_class: 'crypto' as const,
+          current_price: p.current_price,
+          price_change_pct_24h: p.price_change_pct_24h,
+          volume_24h: p.volume_24h,
+          volume_ratio: null,
+          realized_volatility: null,
+          volatility_percentile: null,
+          composite_score: null,
+          sparkline: p.sparkline,
+        }));
+        setSymbols(rows);
+        setLastUpdated(new Date());
+      }).catch(console.error);
+    });
+    api.alerts({}).then(setAlerts).catch(() => {});
   }, [setSymbols, setAlerts]);
 
-  // Refresh: fetch live prices from CoinGecko and merge into store
+  // Refresh: fetch live prices from CoinGecko and update store
   const handleRefresh = useCallback(async () => {
     if (refreshing) return;
     setRefreshing(true);
     try {
       const prices: LivePrice[] = await api.livePrices();
-      const updates = prices.map((p) => ({
+      const rows = prices.map((p, i) => ({
+        symbol_id: i + 1,
         symbol: p.symbol,
-        patch: {
-          current_price: p.current_price,
-          price_change_pct_24h: p.price_change_pct_24h,
-          volume_24h: p.volume_24h,
-          sparkline: p.sparkline,
-        },
+        exchange: 'coingecko',
+        asset_class: 'crypto' as const,
+        current_price: p.current_price,
+        price_change_pct_24h: p.price_change_pct_24h,
+        volume_24h: p.volume_24h,
+        volume_ratio: null,
+        realized_volatility: null,
+        volatility_percentile: null,
+        composite_score: null,
+        sparkline: p.sparkline,
       }));
-      batchUpdateSymbols(updates);
+      setSymbols(rows);
       setLastUpdated(new Date());
     } catch (err) {
       console.error('Refresh failed:', err);
     } finally {
       setRefreshing(false);
     }
-  }, [refreshing, batchUpdateSymbols]);
+  }, [refreshing, setSymbols]);
 
   return (
     <div className="flex h-screen overflow-hidden">
