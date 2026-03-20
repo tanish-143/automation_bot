@@ -11,7 +11,8 @@ import { useEffect, useRef } from 'react';
 import { useStore } from '../store/scanner';
 import type { AlertItem, SymbolRow } from '../types/scanner';
 
-const WS_URL = import.meta.env.VITE_WS_URL ?? `ws://${window.location.host}/ws/scanner`;
+const WS_URL = import.meta.env.VITE_WS_URL ?? '';
+const WS_ENABLED = !!WS_URL;
 const MAX_BACKOFF = 30_000;
 const BATCH_INTERVAL = 200; // ms — batch WS ticks before flushing to store
 
@@ -26,6 +27,9 @@ export function useWebSocket() {
   const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   useEffect(() => {
+    // Skip WebSocket if no URL configured (demo / no live data mode)
+    if (!WS_ENABLED) return;
+
     let unmounted = false;
 
     // Flush buffered WS updates to store every BATCH_INTERVAL ms

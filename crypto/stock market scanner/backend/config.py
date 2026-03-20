@@ -17,11 +17,12 @@ class Settings(BaseSettings):
     # ── Redis (Celery broker + result backend + cache) ──
     redis_url: str = "redis://localhost:6379/0"
 
-    # ── Binance API ──
-    binance_rest_base: str = "https://api.binance.com"
-    binance_ws_base: str = "wss://stream.binance.com:9443"
-    binance_rate_limit_per_min: int = 1200
-    binance_ws_max_streams_per_conn: int = 200  # Binance hard limit: 1024
+    # ── CoinGecko REST API (free, no key required) ──
+    coingecko_rest_base: str = "https://api.coingecko.com/api/v3"
+    coingecko_rate_limit_per_min: int = 30  # free tier: ~10-30 calls/min
+
+    # ── CoinCap WebSocket (free, no key required) ──
+    coincap_ws_url: str = "wss://ws.coincap.io/prices?assets=ALL"
 
     # ── Scanner ──
     scan_interval_seconds: int = 60
