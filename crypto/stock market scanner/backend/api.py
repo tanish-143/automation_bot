@@ -310,81 +310,86 @@ async def get_snapshot_history(
 
 # ─── Live CoinGecko prices (bypass DB for instant refresh) ────────────────────
 
-SYMBOL_TO_COINGECKO: dict[str, str] = {
-    "BTC/USDT": "bitcoin",
-    "ETH/USDT": "ethereum",
-    "SOL/USDT": "solana",
-    "BNB/USDT": "binancecoin",
-    "XRP/USDT": "ripple",
-    "ADA/USDT": "cardano",
-    "DOGE/USDT": "dogecoin",
-    "AVAX/USDT": "avalanche-2",
-    "DOT/USDT": "polkadot",
-    "MATIC/USDT": "matic-network",
-    "LINK/USDT": "chainlink",
-    "UNI/USDT": "uniswap",
-    "ATOM/USDT": "cosmos",
-    "LTC/USDT": "litecoin",
-    "FIL/USDT": "filecoin",
-}
-COINGECKO_TO_SYMBOL: dict[str, str] = {v: k for k, v in SYMBOL_TO_COINGECKO.items()}
+# Tickers to skip: stablecoins, wrapped/pegged assets, LSDs, tokenized securities
+_SKIP_TICKERS = frozenset({
+    # Stablecoins
+    "USDT", "USDC", "USDD", "DAI", "BUSD", "TUSD", "FDUSD", "PYUSD",
+    "USD1", "USDP", "USDE", "SUSDE", "USDS", "USDX", "GUSD", "FRAX",
+    "LUSD", "CRVUSD", "GHO", "USDB", "EURC", "EURS", "USDG", "USDF",
+    "RLUSD", "USDY", "USD0", "USDTB", "USDA", "AUSD", "UDS", "NUSD",
+    "USTBL", "REUSD", "IUSD", "USX", "USDAI", "BFUSD", "BBUSD",
+    # Wrapped / pegged / LSDs
+    "WBTC", "WETH", "STETH", "WSTETH", "CBBTC", "CBETH",
+    "RETH", "WEETH", "METH", "EZETH", "RSETH", "OSETH",
+    "TBTC", "SOLVBTC", "EBTC", "LBTC",
+    # Tokenized real-world / money market
+    "BUIDL", "USYC", "USTB", "YLDS", "OUSG", "JAAA", "JTRSY", "EUTBL",
+    "PAXG", "XAUT", "KAU",
+    # Misc non-trading tokens
+    "FIGR_HELOC", "WLFI", "STABLE",
+})
+
+
+def _coin_symbol(coin: dict) -> str:
+    """Build a trading pair symbol from a CoinGecko coin object."""
+    ticker = (coin.get("symbol") or "").upper()
+    return f"{ticker}/USDT"
 
 
 @app.get("/scan/live-prices")
 async def get_live_prices():
     """
-    Fetch real-time prices directly from CoinGecko API.
+    Fetch real-time prices for top 100+ coins directly from CoinGecko API.
     Used by the frontend refresh button for instant data.
     """
     import httpx
 
-    coin_ids = ",".join(SYMBOL_TO_COINGECKO.values())
     headers = {}
     if settings.coingecko_api_key:
         headers["x-cg-demo-api-key"] = settings.coingecko_api_key
 
-    async with httpx.AsyncClient() as client:
-        resp = await client.get(
-            f"{settings.coingecko_rest_base}/coins/markets",
-            params={
-                "vs_currency": "usd",
-                "ids": coin_ids,
-                "order": "market_cap_desc",
-                "per_page": 50,
-                "page": 1,
-                "sparkline": "true",
-                "price_change_percentage": "24h",
-            },
-            headers=headers,
-            timeout=15.0,
-        )
-        resp.raise_for_status()
-        data = resp.json()
-
     results = []
-    for coin in data:
-        cg_id = coin.get("id", "")
-        our_symbol = COINGECKO_TO_SYMBOL.get(cg_id)
-        if not our_symbol:
-            continue
+    # Fetch 2 pages of 100 to get 200 coins (covers top 100+ after stablecoin filter)
+    async with httpx.AsyncClient() as client:
+        for page in (1, 2):
+            resp = await client.get(
+                f"{settings.coingecko_rest_base}/coins/markets",
+                params={
+                    "vs_currency": "usd",
+                    "order": "market_cap_desc",
+                    "per_page": 100,
+                    "page": page,
+                    "sparkline": "true",
+                    "price_change_percentage": "24h",
+                },
+                headers=headers,
+                timeout=20.0,
+            )
+            resp.raise_for_status()
+            data = resp.json()
 
-        sparkline_data = coin.get("sparkline_in_7d", {}).get("price", [])
-        # Take last 24 points for sparkline
-        sparkline_24h = sparkline_data[-24:] if len(sparkline_data) >= 24 else sparkline_data
+            for coin in data:
+                ticker = (coin.get("symbol") or "").upper()
+                # Skip stablecoins, wrapped assets, and pegged tokens
+                if ticker in _SKIP_TICKERS:
+                    continue
 
-        results.append({
-            "symbol": our_symbol,
-            "current_price": coin.get("current_price") or 0,
-            "price_change_pct_24h": coin.get("price_change_percentage_24h") or 0,
-            "volume_24h": coin.get("total_volume") or 0,
-            "high_24h": coin.get("high_24h") or 0,
-            "low_24h": coin.get("low_24h") or 0,
-            "market_cap": coin.get("market_cap") or 0,
-            "market_cap_rank": coin.get("market_cap_rank"),
-            "sparkline": sparkline_24h,
-            "image": coin.get("image", ""),
-            "last_updated": coin.get("last_updated", ""),
-        })
+                sparkline_data = coin.get("sparkline_in_7d", {}).get("price", [])
+                sparkline_24h = sparkline_data[-24:] if len(sparkline_data) >= 24 else sparkline_data
+
+                results.append({
+                    "symbol": f"{ticker}/USDT",
+                    "current_price": coin.get("current_price") or 0,
+                    "price_change_pct_24h": coin.get("price_change_percentage_24h") or 0,
+                    "volume_24h": coin.get("total_volume") or 0,
+                    "high_24h": coin.get("high_24h") or 0,
+                    "low_24h": coin.get("low_24h") or 0,
+                    "market_cap": coin.get("market_cap") or 0,
+                    "market_cap_rank": coin.get("market_cap_rank"),
+                    "sparkline": sparkline_24h,
+                    "image": coin.get("image", ""),
+                    "last_updated": coin.get("last_updated", ""),
+                })
 
     return results
 
@@ -394,7 +399,7 @@ async def get_live_prices():
 @app.get("/scan/ai-analysis")
 async def get_ai_analysis():
     """
-    Fetch live prices from CoinGecko, send to Groq AI,
+    Fetch live prices for top 100 coins from CoinGecko, send to Groq AI,
     and return markdown trade setup analysis.
     """
     import httpx
@@ -403,8 +408,6 @@ async def get_ai_analysis():
     if not settings.groq_api_key:
         raise HTTPException(503, "Groq API key not configured")
 
-    # Step 1: Fetch fresh prices
-    coin_ids = ",".join(SYMBOL_TO_COINGECKO.values())
     headers = {}
     if settings.coingecko_api_key:
         headers["x-cg-demo-api-key"] = settings.coingecko_api_key
@@ -415,34 +418,31 @@ async def get_ai_analysis():
                 f"{settings.coingecko_rest_base}/coins/markets",
                 params={
                     "vs_currency": "usd",
-                    "ids": coin_ids,
                     "order": "market_cap_desc",
-                    "per_page": 50,
+                    "per_page": 100,
                     "page": 1,
                     "sparkline": "false",
                     "price_change_percentage": "24h",
                 },
                 headers=headers,
-                timeout=15.0,
+                timeout=20.0,
             )
             resp.raise_for_status()
             data = resp.json()
     except Exception as e:
         raise HTTPException(502, f"CoinGecko fetch failed: {e}")
 
-    # Step 2: Map to our format
     prices = []
     for coin in data:
-        cg_id = coin.get("id", "")
-        our_symbol = COINGECKO_TO_SYMBOL.get(cg_id)
-        if not our_symbol:
+        ticker = (coin.get("symbol") or "").upper()
+        if ticker in _SKIP_TICKERS:
             continue
         prices.append({
-            "symbol": our_symbol,
+            "symbol": f"{ticker}/USDT",
             "current_price": coin.get("current_price") or 0,
             "price_change_pct_24h": coin.get("price_change_percentage_24h") or 0,
             "volume_24h": coin.get("total_volume") or 0,
-            "volume_ratio": 0,  # Not available from CoinGecko directly
+            "volume_ratio": 0,
         })
 
     # Step 3: Send to Groq AI

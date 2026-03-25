@@ -11,6 +11,7 @@
 
 import { memo, useMemo, useState } from 'react';
 import { useStore } from '../../store/scanner';
+import { useFilteredSymbols } from '../../hooks/useFilteredSymbols';
 import { Sparkline } from '../common/Sparkline';
 import type { SymbolRow } from '../../types/scanner';
 import clsx from 'clsx';
@@ -30,7 +31,7 @@ function pctClass(v: number | null): string {
 }
 
 export function ScannerTable() {
-  const symbols = useStore((s) => s.symbols);
+  const symbols = useFilteredSymbols();
   const openDetail = useStore((s) => s.openDetail);
   const [sortKey, setSortKey] = useState<SortKey>('composite_score');
   const [sortDesc, setSortDesc] = useState(true);

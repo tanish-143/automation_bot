@@ -4,7 +4,7 @@
  * Features:
  *   • Auto-scrolls to bottom on new alerts
  *   • Color-coded by rule type
- *   • CSV export via Blob download
+ *   • CSV export only on explicit button click
  *   • Caps display at 200 items for perf
  */
 
@@ -74,9 +74,18 @@ export function AlertsFeed() {
         </h3>
         <button
           onClick={handleExport}
-          className="text-[10px] px-2 py-0.5 rounded bg-zinc-800 text-zinc-400 hover:bg-zinc-700 transition-colors"
+          disabled={alerts.length === 0}
+          className="flex items-center gap-1.5 text-[11px] px-2.5 py-1 rounded-md
+            bg-indigo-600/20 text-indigo-300 border border-indigo-500/30
+            hover:bg-indigo-600/30 hover:border-indigo-500/50 hover:text-indigo-200
+            disabled:opacity-30 disabled:cursor-not-allowed disabled:hover:bg-indigo-600/20
+            transition-all duration-200 active:scale-95 font-medium"
+          title={alerts.length === 0 ? 'No alerts to export' : `Export ${alerts.length} alerts as CSV`}
         >
-          CSV ↓
+          <svg className="w-3 h-3" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+            <path strokeLinecap="round" strokeLinejoin="round" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" />
+          </svg>
+          Export CSV
         </button>
       </div>
 

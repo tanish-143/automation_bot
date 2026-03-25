@@ -23,7 +23,7 @@ export function DetailModal() {
 
   const row = symbols.find((s) => s.symbol_id === selectedSymbolId) ?? null;
 
-  // Fetch snapshot data
+  // Fetch snapshot data — fall back to sparkline from CoinGecko
   useEffect(() => {
     if (!selectedSymbolId || !detailOpen) return;
     let cancelled = false;
@@ -31,18 +31,40 @@ export function DetailModal() {
     api
       .snapshot(selectedSymbolId)
       .then((data) => {
-        if (!cancelled) setSnapshots(data);
+        if (!cancelled) {
+          if (data.length > 0) {
+            setSnapshots(data);
+          } else {
+            setSnapshots(buildSparklineSnapshots());
+          }
+        }
       })
       .catch(() => {
-        if (!cancelled) setSnapshots([]);
+        if (!cancelled) setSnapshots(buildSparklineSnapshots());
       })
       .finally(() => {
         if (!cancelled) setLoading(false);
       });
+
+    function buildSparklineSnapshots(): SnapshotPoint[] {
+      const currentRow = symbols.find((s) => s.symbol_id === selectedSymbolId);
+      const spark = currentRow?.sparkline;
+      if (!spark || spark.length === 0) return [];
+      const now = Date.now();
+      const stepMs = (24 * 60 * 60 * 1000) / spark.length;
+      return spark.map((price, i) => ({
+        ts: new Date(now - (spark.length - 1 - i) * stepMs).toISOString(),
+        current_price: price,
+        volume_ratio: null,
+        realized_volatility: null,
+        volume_24h: null,
+      }));
+    }
+
     return () => {
       cancelled = true;
     };
-  }, [selectedSymbolId, detailOpen]);
+  }, [selectedSymbolId, detailOpen, symbols]);
 
   // Create / update chart
   useEffect(() => {
@@ -160,7 +182,7 @@ export function DetailModal() {
             value={row.price_change_pct_24h != null ? `${row.price_change_pct_24h.toFixed(2)}%` : '—'}
             color={row.price_change_pct_24h != null && row.price_change_pct_24h >= 0 ? 'text-green-400' : 'text-red-400'}
           />
-          <Metric label="Vol Ratio" value={row.volume_ratio != null ? `${row.volume_ratio.toFixed(2)}x` : '—'} />
+          <Metric label="Volume 24h" value={row.volume_24h != null ? fmtVol(row.volume_24h) : '—'} />
           <Metric
             label="Score"
             value={row.composite_score != null ? row.composite_score.toFixed(0) : '—'}
@@ -190,4 +212,11 @@ function Metric({ label, value, color }: { label: string; value: string; color?:
 function fmt(n: number): string {
   if (n >= 1) return n.toLocaleString(undefined, { maximumFractionDigits: 2 });
   return n.toPrecision(4);
+}
+
+function fmtVol(n: number): string {
+  if (n >= 1_000_000_000) return `$${(n / 1_000_000_000).toFixed(1)}B`;
+  if (n >= 1_000_000) return `$${(n / 1_000_000).toFixed(1)}M`;
+  if (n >= 1_000) return `$${(n / 1_000).toFixed(1)}K`;
+  return `$${n.toFixed(0)}`;
 }

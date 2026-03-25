@@ -7,15 +7,17 @@
  *   60–80 → warm (amber)
  *   80+   → hot (emerald/green glow)
  *
- * Tile size proportional to log(volume_24h) so high-volume symbols
- * are visually larger (treemap-like layout via CSS grid auto-fill).
- *
- * Hover: shows a floating popup card with detailed metrics, shadow & glass effect.
+ * Auto-popup: cycles through the most volatile coins (|24h%| ≥ 5%)
+ * showing their popup cards automatically. Pauses on manual hover.
  */
 
-import { memo, useMemo, useState, useRef, useCallback } from 'react';
+import { memo, useMemo, useState, useRef, useCallback, useEffect } from 'react';
 import { useStore } from '../../store/scanner';
+import { useFilteredSymbols } from '../../hooks/useFilteredSymbols';
 import type { SymbolRow } from '../../types/scanner';
+
+const VOLATILE_THRESHOLD = 5; // |24h%| >= 5% counts as volatile
+const AUTO_POPUP_INTERVAL = 4000; // cycle every 4s
 
 function scoreToColor(score: number | null): string {
   if (score == null) return 'rgba(63,63,70,0.5)';
@@ -66,38 +68,91 @@ function fmt(n: number | null | undefined, decimals = 2): string {
 }
 
 export function Heatmap() {
-  const symbols = useStore((s) => s.symbols);
+  const filteredSymbols = useFilteredSymbols();
   const openDetail = useStore((s) => s.openDetail);
 
   const tiles = useMemo(
-    () => [...symbols].sort((a, b) => (b.composite_score ?? 0) - (a.composite_score ?? 0)).slice(0, 100),
-    [symbols],
+    () => [...filteredSymbols]
+      .sort((a, b) => {
+        // Sort by |price_change_pct_24h| desc first, then composite_score
+        const aVol = Math.abs(a.price_change_pct_24h ?? 0);
+        const bVol = Math.abs(b.price_change_pct_24h ?? 0);
+        if (bVol !== aVol) return bVol - aVol;
+        return (b.composite_score ?? 0) - (a.composite_score ?? 0);
+      })
+      .slice(0, 100),
+    [filteredSymbols],
   );
+
+  // Volatile coins for auto-popup
+  const volatileCoins = useMemo(
+    () => tiles.filter((t) => t.price_change_pct_24h != null && Math.abs(t.price_change_pct_24h) >= VOLATILE_THRESHOLD),
+    [tiles],
+  );
+  const volatileSet = useMemo(() => new Set(volatileCoins.map((c) => c.symbol)), [volatileCoins]);
 
   const [hoveredSymbol, setHoveredSymbol] = useState<SymbolRow | null>(null);
   const [popupPos, setPopupPos] = useState<{ x: number; y: number }>({ x: 0, y: 0 });
+  const [autoRow, setAutoRow] = useState<SymbolRow | null>(null);
+  const [autoPos, setAutoPos] = useState<{ x: number; y: number }>({ x: 0, y: 0 });
+  const isHovering = useRef(false);
   const containerRef = useRef<HTMLDivElement>(null);
 
+  // Auto-cycle popup through volatile coins
+  useEffect(() => {
+    if (volatileCoins.length === 0) return;
+    let idx = 0;
+
+    const showNext = () => {
+      if (isHovering.current) return;
+      const coin = volatileCoins[idx % volatileCoins.length];
+      const container = containerRef.current;
+      const el = container?.querySelector<HTMLElement>(`[data-symbol="${CSS.escape(coin.symbol)}"]`);
+      if (el && container) {
+        const tr = el.getBoundingClientRect();
+        const cr = container.getBoundingClientRect();
+        setAutoRow(coin);
+        setAutoPos({ x: tr.left - cr.left + tr.width + 4, y: tr.top - cr.top });
+      }
+      idx++;
+    };
+
+    showNext();
+    const timer = setInterval(showNext, AUTO_POPUP_INTERVAL);
+    return () => clearInterval(timer);
+  }, [volatileCoins]);
+
   const handleTileHover = useCallback((row: SymbolRow, e: React.MouseEvent) => {
+    isHovering.current = true;
+    setAutoRow(null);
     const rect = containerRef.current?.getBoundingClientRect();
     if (!rect) return;
-    const x = e.clientX - rect.left;
-    const y = e.clientY - rect.top;
     setHoveredSymbol(row);
-    setPopupPos({ x, y });
+    setPopupPos({ x: e.clientX - rect.left, y: e.clientY - rect.top });
   }, []);
 
   const handleTileLeave = useCallback(() => {
+    isHovering.current = false;
     setHoveredSymbol(null);
   }, []);
+
+  const activePopupRow = hoveredSymbol ?? autoRow;
+  const activePopupPos = hoveredSymbol ? popupPos : autoPos;
 
   return (
     <div ref={containerRef} className="p-4 relative">
       {/* Header */}
       <div className="flex items-center justify-between mb-3">
-        <h3 className="text-xs font-semibold text-zinc-500 uppercase tracking-wider">
-          🔥 Heatmap — Top {tiles.length} by Composite Score
-        </h3>
+        <div className="flex items-center gap-3">
+          <h3 className="text-xs font-semibold text-zinc-500 uppercase tracking-wider">
+            🔥 Heatmap — Top {tiles.length}
+          </h3>
+          {volatileCoins.length > 0 && (
+            <span className="text-[10px] px-2 py-0.5 rounded-full bg-rose-500/20 text-rose-400 border border-rose-500/30 animate-pulse">
+              {volatileCoins.length} volatile
+            </span>
+          )}
+        </div>
         <div className="flex items-center gap-3 text-[10px] text-zinc-600">
           <span className="flex items-center gap-1">
             <span className="w-3 h-3 rounded-sm" style={{ backgroundColor: 'rgba(100,116,139,0.15)' }} />
@@ -124,6 +179,8 @@ export function Heatmap() {
           <HeatmapTile
             key={row.symbol}
             row={row}
+            isVolatile={volatileSet.has(row.symbol)}
+            isAutoHighlighted={autoRow?.symbol === row.symbol && !hoveredSymbol}
             onClick={() => openDetail(row.symbol_id)}
             onHover={handleTileHover}
             onLeave={handleTileLeave}
@@ -132,8 +189,8 @@ export function Heatmap() {
       </div>
 
       {/* Floating Popup Card */}
-      {hoveredSymbol && (
-        <HeatmapPopup row={hoveredSymbol} pos={popupPos} containerRef={containerRef} />
+      {activePopupRow && (
+        <HeatmapPopup row={activePopupRow} pos={activePopupPos} containerRef={containerRef} />
       )}
     </div>
   );
@@ -143,11 +200,15 @@ export function Heatmap() {
 
 const HeatmapTile = memo(function HeatmapTile({
   row,
+  isVolatile,
+  isAutoHighlighted,
   onClick,
   onHover,
   onLeave,
 }: {
   row: SymbolRow;
+  isVolatile: boolean;
+  isAutoHighlighted: boolean;
   onClick: () => void;
   onHover: (row: SymbolRow, e: React.MouseEvent) => void;
   onLeave: () => void;
@@ -158,22 +219,40 @@ const HeatmapTile = memo(function HeatmapTile({
   const glow = scoreToGlow(row.composite_score);
   const changePct = row.price_change_pct_24h;
 
+  const volatileBorder = isVolatile
+    ? isAutoHighlighted
+      ? '2px solid rgba(239,68,68,0.7)'
+      : '2px solid rgba(239,68,68,0.35)'
+    : `1px solid ${borderColor}`;
+
+  const volatileGlow = isVolatile
+    ? isAutoHighlighted
+      ? `${glow}, 0 0 12px rgba(239,68,68,0.4), 0 0 24px rgba(239,68,68,0.15)`
+      : `${glow}, 0 0 8px rgba(239,68,68,0.2)`
+    : glow;
+
   return (
     <button
+      data-symbol={row.symbol}
       onClick={onClick}
       onMouseEnter={(e) => onHover(row, e)}
       onMouseMove={(e) => onHover(row, e)}
       onMouseLeave={onLeave}
-      className="relative rounded-lg p-2 text-center cursor-pointer
+      className={`relative rounded-lg p-2 text-center cursor-pointer
         transition-all duration-200 ease-out
         hover:scale-110 hover:z-20
-        active:scale-100"
+        active:scale-100
+        ${isVolatile ? 'volatile-tile' : ''}
+        ${isAutoHighlighted ? 'z-30 scale-105' : ''}`}
       style={{
         backgroundColor: bgColor,
-        border: `1px solid ${borderColor}`,
-        boxShadow: glow,
+        border: volatileBorder,
+        boxShadow: volatileGlow,
       }}
     >
+      {isVolatile && (
+        <span className="absolute -top-1 -right-1 w-2 h-2 rounded-full bg-rose-500 volatile-dot" />
+      )}
       <div className="text-[11px] font-bold truncate" style={{ color: textColor }}>
         {row.symbol.replace('/USDT', '').replace('/USD', '')}
       </div>
