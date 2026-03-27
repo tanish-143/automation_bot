@@ -85,6 +85,275 @@ async function fetchKlines(rawSymbol, interval = '1h', limit = 24) {
   return data.map(k => parseFloat(k[4])); // close prices
 }
 
+async function fetchOHLCV(rawSymbol, interval = '4h', limit = 100) {
+  const res = await fetch(
+    `${BINANCE_API}/api/v3/klines?symbol=${rawSymbol}&interval=${interval}&limit=${limit}`
+  );
+  if (!res.ok) return null;
+  const data = await res.json();
+  return data.map(k => ({
+    ts: k[0],
+    open: parseFloat(k[1]),
+    high: parseFloat(k[2]),
+    low: parseFloat(k[3]),
+    close: parseFloat(k[4]),
+    volume: parseFloat(k[5]),
+  }));
+}
+
+/* ── Delta Exchange Public API (No API Key) ─────────────── */
+const DELTA_API = 'https://api.delta.exchange';
+
+async function fetchDeltaTickers() {
+  try {
+    const res = await fetch(`${DELTA_API}/v2/tickers`);
+    if (!res.ok) throw new Error(`Delta API ${res.status}`);
+    const json = await res.json();
+    if (!json.success) throw new Error('Delta API returned success=false');
+    const tickers = json.result || [];
+    // Filter: must have a price, decent volume, and be perpetual_futures or spot
+    const validTypes = new Set(['perpetual_futures', 'spot']);
+    return tickers
+      .filter(t => {
+        if (!t.symbol) return false;
+        if (!validTypes.has(t.contract_type)) return false;
+        const price = parseFloat(t.close || t.mark_price || 0);
+        if (price <= 0) return false;
+        const vol = parseFloat(t.turnover_usd || 0);
+        if (vol < 1000) return false;
+        return true;
+      })
+      .sort((a, b) => parseFloat(b.turnover_usd || 0) - parseFloat(a.turnover_usd || 0))
+      .slice(0, 200)
+      .map((t, i) => {
+        const close = parseFloat(t.close || t.mark_price);
+        const markPrice = parseFloat(t.mark_price || close);
+        const changePct = parseFloat(t.ltp_change_24h || 0);
+        // Normalize symbol for display: "BTCUSDT" → "BTC/USDT", "XRP_USDT" → "XRP/USDT"
+        let displaySymbol = t.symbol.replace('_', '');
+        if (displaySymbol.endsWith('USDT')) displaySymbol = displaySymbol.replace('USDT', '/USDT');
+        else if (displaySymbol.endsWith('USDC')) displaySymbol = displaySymbol.replace('USDC', '/USDC');
+        else if (displaySymbol.endsWith('USD')) displaySymbol = displaySymbol.replace('USD', '/USD');
+        // Prefix with Δ to distinguish from Binance when same pair exists
+        displaySymbol = 'Δ' + displaySymbol;
+
+        // Extra Delta data
+        const spreadPct = t.quotes ? (() => {
+          const ask = parseFloat(t.quotes.best_ask || 0);
+          const bid = parseFloat(t.quotes.best_bid || 0);
+          return ask > 0 && bid > 0 ? +((ask - bid) / ask * 100).toFixed(4) : null;
+        })() : null;
+        const bestBid = t.quotes ? parseFloat(t.quotes.best_bid || 0) || null : null;
+        const bestAsk = t.quotes ? parseFloat(t.quotes.best_ask || 0) || null : null;
+        const bidSize = t.quotes ? parseFloat(t.quotes.bid_size || 0) || null : null;
+        const askSize = t.quotes ? parseFloat(t.quotes.ask_size || 0) || null : null;
+
+        return {
+          symbol_id: 10000 + i,
+          symbol: displaySymbol,
+          exchange: 'delta',
+          asset_class: 'crypto',
+          current_price: close,
+          price_change_pct_24h: +changePct.toFixed(2),
+          volume_24h: parseFloat(t.turnover_usd || 0),
+          volume_ratio: null,
+          realized_volatility: null,
+          volatility_percentile: null,
+          composite_score: null,
+          high_24h: parseFloat(t.high || close),
+          low_24h: parseFloat(t.low || close),
+          sparkline: [],
+          raw_symbol: t.symbol,
+          delta_product_id: t.product_id,
+          contract_type: t.contract_type === 'perpetual_futures' ? 'perp' : t.contract_type,
+          open_interest: t.oi ? parseFloat(t.oi) : null,
+          open_interest_usd: t.oi_value_usd ? parseFloat(t.oi_value_usd) : null,
+          oi_change_6h: t.oi_change_usd_6h ? parseFloat(t.oi_change_usd_6h) : null,
+          mark_price: markPrice,
+          mark_change_24h: t.mark_change_24h ? parseFloat(t.mark_change_24h) : null,
+          spot_price: t.spot_price ? parseFloat(t.spot_price) : null,
+          basis_pct: (markPrice && t.spot_price && parseFloat(t.spot_price) > 0) ? +((markPrice - parseFloat(t.spot_price)) / parseFloat(t.spot_price) * 100).toFixed(4) : null,
+          spread_pct: spreadPct,
+          best_bid: bestBid,
+          best_ask: bestAsk,
+          bid_size: bidSize,
+          ask_size: askSize,
+          turnover_symbol: t.turnover_symbol || 'USDT',
+          product_status: t.product_trading_status || null,
+          description: t.description || null,
+        };
+      });
+  } catch (err) {
+    console.warn('Delta Exchange fetch failed:', err.message);
+    return [];
+  }
+}
+
+async function fetchDeltaProducts() {
+  try {
+    const res = await fetch(`${DELTA_API}/v2/products?contract_types=perpetual_futures&page_size=200`);
+    if (!res.ok) throw new Error(`Delta products API ${res.status}`);
+    const json = await res.json();
+    if (!json.result) return {};
+    const map = {};
+    for (const p of json.result) {
+      if (!p.symbol) continue;
+      const si = p.spot_index || {};
+      map[p.symbol] = {
+        annualized_funding: p.annualized_funding != null ? parseFloat(p.annualized_funding) : null,
+        default_leverage: p.default_leverage != null ? parseFloat(p.default_leverage) : null,
+        initial_margin: p.initial_margin != null ? parseFloat(p.initial_margin) : null,
+        maintenance_margin: p.maintenance_margin != null ? parseFloat(p.maintenance_margin) : null,
+        maker_fee: p.maker_commission_rate != null ? parseFloat(p.maker_commission_rate) : null,
+        taker_fee: p.taker_commission_rate != null ? parseFloat(p.taker_commission_rate) : null,
+        contract_value: p.contract_value != null ? parseFloat(p.contract_value) : null,
+        tick_size: p.tick_size != null ? parseFloat(p.tick_size) : null,
+        funding_method: p.funding_method || null,
+        impact_size: p.impact_size != null ? parseFloat(p.impact_size) : null,
+        spot_index_symbol: si.symbol || null,
+        constituent_exchanges: (si.constituent_exchanges || []).map(c => c.exchange).filter(Boolean),
+      };
+    }
+    return map;
+  } catch (err) {
+    console.warn('Delta products fetch failed:', err.message);
+    return {};
+  }
+}
+
+async function fetchDeltaTickerDetail(symbol) {
+  try {
+    const res = await fetch(`${DELTA_API}/v2/tickers/${symbol}`);
+    if (!res.ok) return null;
+    const json = await res.json();
+    if (!json.success || !json.result) return null;
+    const t = json.result;
+    return {
+      funding_rate: t.funding_rate != null ? parseFloat(t.funding_rate) : null,
+      mark_basis: t.mark_basis != null ? parseFloat(t.mark_basis) : null,
+      open_price: t.open != null ? parseFloat(t.open) : null,
+      volume_base: t.volume != null ? parseFloat(t.volume) : null,
+      size_contracts: t.size != null ? parseFloat(t.size) : null,
+      leverage: t.leverage != null ? parseFloat(t.leverage) : null,
+      tags: t.tags || [],
+      top_tag: t.top_tag || null,
+      greeks: t.greeks || null,
+    };
+  } catch {
+    return null;
+  }
+}
+
+async function fetchDeltaOrderbook(symbol) {
+  try {
+    const res = await fetch(`${DELTA_API}/v2/l2orderbook/${symbol}`);
+    if (!res.ok) return null;
+    const json = await res.json();
+    if (!json.success || !json.result) return null;
+    const r = json.result;
+    const buys = (r.buy || []).slice(0, 20);
+    const sells = (r.sell || []).slice(0, 20);
+    const bidDepth = buys.reduce((s, b) => s + (parseFloat(b.size) || 0), 0);
+    const askDepth = sells.reduce((s, b) => s + (parseFloat(b.size) || 0), 0);
+    // Find walls (levels with size > 3x average)
+    const avgBid = bidDepth / (buys.length || 1);
+    const avgAsk = askDepth / (sells.length || 1);
+    const bidWalls = buys.filter(b => parseFloat(b.size) > avgBid * 3).map(b => ({ price: parseFloat(b.price), size: parseFloat(b.size) }));
+    const askWalls = sells.filter(s => parseFloat(s.size) > avgAsk * 3).map(s => ({ price: parseFloat(s.price), size: parseFloat(s.size) }));
+    return {
+      bid_depth_20: bidDepth,
+      ask_depth_20: askDepth,
+      bid_ask_ratio: askDepth > 0 ? +(bidDepth / askDepth).toFixed(3) : null,
+      bid_levels: buys.length,
+      ask_levels: sells.length,
+      bid_walls: bidWalls.slice(0, 3),
+      ask_walls: askWalls.slice(0, 3),
+      imbalance: askDepth > 0 ? +(((bidDepth - askDepth) / (bidDepth + askDepth)) * 100).toFixed(2) : null,
+    };
+  } catch {
+    return null;
+  }
+}
+
+async function fetchDeltaRecentTrades(symbol) {
+  try {
+    const res = await fetch(`${DELTA_API}/v2/trades/${symbol}`);
+    if (!res.ok) return null;
+    const json = await res.json();
+    if (!json.success || !json.result) return null;
+    const trades = json.result;
+    let buyVol = 0, sellVol = 0, buyCount = 0, sellCount = 0;
+    let bigTrades = [];
+    const avgSize = trades.reduce((s, t) => s + (parseFloat(t.size) || 0), 0) / (trades.length || 1);
+    for (const t of trades) {
+      const size = parseFloat(t.size) || 0;
+      const price = parseFloat(t.price) || 0;
+      if (t.buyer_role === 'taker') { buyVol += size; buyCount++; }
+      else { sellVol += size; sellCount++; }
+      if (size > avgSize * 3) bigTrades.push({ price, size, side: t.buyer_role === 'taker' ? 'buy' : 'sell' });
+    }
+    return {
+      total_trades: trades.length,
+      buy_volume: buyVol,
+      sell_volume: sellVol,
+      buy_count: buyCount,
+      sell_count: sellCount,
+      buy_pct: trades.length > 0 ? +((buyCount / trades.length) * 100).toFixed(1) : 50,
+      sell_pct: trades.length > 0 ? +((sellCount / trades.length) * 100).toFixed(1) : 50,
+      big_trades: bigTrades.slice(0, 5),
+      net_flow: buyVol - sellVol,
+    };
+  } catch {
+    return null;
+  }
+}
+
+async function fetchDeltaKlines(symbol, resolution = '1h', limit = 24) {
+  try {
+    const end = Math.floor(Date.now() / 1000);
+    // Resolution map for Delta: 1m,5m,15m,30m,1h,2h,4h,6h,1d,1w
+    const resMap = { '1m':'1m', '5m':'5m', '15m':'15m', '1h':'1h', '4h':'4h', '1d':'1d' };
+    const res = resolution in resMap ? resMap[resolution] : '1h';
+    const seconds = { '1m':60,'5m':300,'15m':900,'1h':3600,'4h':14400,'1d':86400 };
+    const start = end - (seconds[res] || 3600) * limit;
+    const resp = await fetch(
+      `${DELTA_API}/v2/history/candles?resolution=${res}&symbol=${symbol}&start=${start}&end=${end}`
+    );
+    if (!resp.ok) return [];
+    const json = await resp.json();
+    const candles = json.result || [];
+    return candles.map(c => parseFloat(c.close)).filter(v => v > 0);
+  } catch {
+    return [];
+  }
+}
+
+async function fetchDeltaOHLCV(symbol, resolution = '4h', limit = 100) {
+  try {
+    const end = Math.floor(Date.now() / 1000);
+    const seconds = { '1m':60,'5m':300,'15m':900,'1h':3600,'4h':14400,'1d':86400 };
+    const sec = seconds[resolution] || 14400;
+    const start = end - sec * limit;
+    const resp = await fetch(
+      `${DELTA_API}/v2/history/candles?resolution=${resolution}&symbol=${symbol}&start=${start}&end=${end}`
+    );
+    if (!resp.ok) return null;
+    const json = await resp.json();
+    const candles = json.result || [];
+    if (candles.length === 0) return null;
+    return candles.map(c => ({
+      ts: c.time * 1000,
+      open: parseFloat(c.open),
+      high: parseFloat(c.high),
+      low: parseFloat(c.low),
+      close: parseFloat(c.close),
+      volume: parseFloat(c.volume || 0),
+    })).filter(c => c.close > 0);
+  } catch {
+    return null;
+  }
+}
+
 /* ── Simple State Store (like Zustand) ──────────────────── */
 let storeState = {
   symbols: [],
@@ -246,6 +515,19 @@ function FilterPanel() {
       </fieldset>
 
       <fieldset>
+        <legend className="text-xs text-zinc-500 mb-1.5">Exchange</legend>
+        <div className="flex flex-wrap gap-1.5">
+          {[{v:'all',l:'All',icon:''},{v:'binance',l:'Binance',icon:'🟡'},{v:'delta',l:'Delta',icon:'🔺'}].map(ex => (
+            <button key={ex.v} onClick={() => setFilters({ exchange: ex.v })}
+              className={`px-2.5 py-1 rounded text-xs font-medium transition ${
+                filters.exchange === ex.v ? 'bg-indigo-600 text-white' : 'bg-zinc-800 text-zinc-400 hover:bg-zinc-700'}`}>
+              {ex.icon} {ex.l}
+            </button>
+          ))}
+        </div>
+      </fieldset>
+
+      <fieldset>
         <legend className="text-xs text-zinc-500 mb-1.5">Asset Class</legend>
         <div className="flex gap-1.5">
           {['all','crypto'].map(ac => (
@@ -266,8 +548,13 @@ const SymbolRowComponent = memo(function SymbolRowComponent({ row, onClick }) {
   return (
     <tr onClick={onClick} className="border-b border-zinc-800/50 hover:bg-zinc-800/40 cursor-pointer transition-colors">
       <td className="px-3 py-2">
-        <div className="font-medium text-zinc-100">{row.symbol}</div>
-        <div className="text-[10px] text-zinc-600">{row.exchange}</div>
+        <div className="flex items-center gap-1.5">
+          <span className="text-[10px]">{row.exchange === 'delta' ? '🔺' : '🟡'}</span>
+          <div>
+            <div className="font-medium text-zinc-100">{row.symbol}</div>
+            <div className="text-[10px] text-zinc-600">{row.exchange}{row.contract_type ? ` · ${row.contract_type}` : ''}</div>
+          </div>
+        </div>
       </td>
       <td className="px-3 py-2 font-mono text-zinc-200">${fmtPrice(row.current_price)}</td>
       <td className={`px-3 py-2 font-mono ${pctClass(row.price_change_pct_24h)}`}>
@@ -276,9 +563,34 @@ const SymbolRowComponent = memo(function SymbolRowComponent({ row, onClick }) {
       <td className="px-3 py-2 font-mono text-zinc-300">${fmt(row.volume_24h, 0)}</td>
       <td className="px-3 py-2 font-mono text-zinc-300">${fmtPrice(row.high_24h)}</td>
       <td className="px-3 py-2 font-mono text-zinc-300">${fmtPrice(row.low_24h)}</td>
-      <td className="px-3 py-2">
-        <Sparkline data={row.sparkline} positive={row.price_change_pct_24h != null ? row.price_change_pct_24h >= 0 : undefined} />
-      </td>
+      {row.exchange === 'delta' ? (
+        <td className="px-3 py-2">
+          <div className="text-[10px]">
+            <span className="font-mono text-zinc-300">{row.contract_type || 'perp'}</span>
+            {row.default_leverage != null && (
+              <span className="text-yellow-500 ml-1">{row.default_leverage}x</span>
+            )}
+            {row.open_interest_usd > 0 && (
+              <span className="text-zinc-600 ml-1">OI ${fmt(row.open_interest_usd, 0)}</span>
+            )}
+            {row.annualized_funding != null && (
+              <div className={row.annualized_funding >= 0 ? 'text-emerald-500' : 'text-red-400'}>
+                Fund {row.annualized_funding > 0 ? '+' : ''}{row.annualized_funding.toFixed(2)}% APR
+              </div>
+            )}
+            {row.spread_pct != null && (
+              <div className="text-zinc-600">Spread {row.spread_pct.toFixed(3)}%{row.basis_pct != null ? ` · Basis ${row.basis_pct > 0 ? '+' : ''}${row.basis_pct.toFixed(3)}%` : ''}</div>
+            )}
+            {row.maker_fee != null && row.taker_fee != null && (
+              <div className="text-zinc-600">Fee M:{(row.maker_fee * 100).toFixed(2)}% T:{(row.taker_fee * 100).toFixed(2)}%</div>
+            )}
+          </div>
+        </td>
+      ) : (
+        <td className="px-3 py-2">
+          <Sparkline data={row.sparkline} positive={row.price_change_pct_24h != null ? row.price_change_pct_24h >= 0 : undefined} />
+        </td>
+      )}
     </tr>
   );
 });
@@ -335,7 +647,7 @@ function ScannerTable() {
                 {label}{sortIcon(key)}
               </th>
             ))}
-            <th className="px-3 py-2 text-left">Spark</th>
+            <th className="px-3 py-2 text-left">Spark / Fund</th>
           </tr>
         </thead>
         <tbody>
@@ -372,6 +684,7 @@ const HeatmapTile = memo(function HeatmapTile({ row, isVolatile, onClick }) {
       className={`relative rounded-lg p-2 text-center cursor-pointer transition-all duration-200 ease-out hover:scale-110 hover:z-20 active:scale-100 ${isVolatile ? 'volatile-tile' : ''}`}
       style={{ backgroundColor: bgColor, border: `1px solid ${borderColor}` }}>
       {isVolatile && <span className="absolute -top-1 -right-1 w-2 h-2 rounded-full bg-rose-500 volatile-dot" />}
+      {row.exchange === 'delta' && <span className="absolute -top-1 -left-1 text-[8px]">🔺</span>}
       <div className="text-[11px] font-bold truncate text-zinc-200">
         {row.symbol.replace('/USDT', '').replace('/USD', '')}
       </div>
@@ -445,16 +758,42 @@ function DetailModal() {
 
   const [snapshots, setSnapshots] = useState([]);
   const [loading, setLoading] = useState(false);
+  const [deltaDetail, setDeltaDetail] = useState(null);
+  const [orderbook, setOrderbook] = useState(null);
+  const [recentTrades, setRecentTrades] = useState(null);
+  const [detailLoading, setDetailLoading] = useState(false);
 
   useEffect(() => {
     if (!detailOpen || !selectedSymbol) return;
     let cancelled = false;
     setLoading(true);
-    fetchKlines(selectedSymbol.raw_symbol, '1h', 48).then(prices => {
+    setDeltaDetail(null);
+    setOrderbook(null);
+    setRecentTrades(null);
+
+    const klFn = selectedSymbol.exchange === 'delta' ? fetchDeltaKlines : fetchKlines;
+    klFn(selectedSymbol.raw_symbol, '1h', 48).then(prices => {
       if (!cancelled) setSnapshots(prices);
     }).catch(() => {
       if (!cancelled && selectedSymbol.sparkline?.length) setSnapshots(selectedSymbol.sparkline);
     }).finally(() => { if (!cancelled) setLoading(false); });
+
+    // Fetch on-demand Delta data
+    if (selectedSymbol.exchange === 'delta' && selectedSymbol.raw_symbol) {
+      setDetailLoading(true);
+      Promise.all([
+        fetchDeltaTickerDetail(selectedSymbol.raw_symbol).catch(() => null),
+        fetchDeltaOrderbook(selectedSymbol.raw_symbol).catch(() => null),
+        fetchDeltaRecentTrades(selectedSymbol.raw_symbol).catch(() => null),
+      ]).then(([detail, ob, trades]) => {
+        if (!cancelled) {
+          setDeltaDetail(detail);
+          setOrderbook(ob);
+          setRecentTrades(trades);
+        }
+      }).finally(() => { if (!cancelled) setDetailLoading(false); });
+    }
+
     return () => { cancelled = true; };
   }, [detailOpen, selectedSymbol]);
 
@@ -498,11 +837,16 @@ function DetailModal() {
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm">
       <div className="absolute inset-0" onClick={close} />
-      <div className="relative z-10 bg-zinc-900 border border-zinc-700 rounded-lg shadow-xl w-full max-w-2xl mx-4 animate-in">
-        <div className="flex items-center justify-between p-4 border-b border-zinc-800">
-          <div>
+      <div className="relative z-10 bg-zinc-900 border border-zinc-700 rounded-lg shadow-xl w-full max-w-3xl mx-4 max-h-[90vh] overflow-y-auto animate-in">
+        <div className="flex items-center justify-between p-4 border-b border-zinc-800 sticky top-0 bg-zinc-900 z-10">
+          <div className="flex items-center gap-2">
             <span className="text-lg font-bold text-zinc-100">{row.symbol}</span>
-            <span className="ml-2 text-sm text-zinc-500">{row.exchange}</span>
+            <span className="text-sm text-zinc-500">{row.exchange}</span>
+            {deltaDetail?.tags?.length > 0 && (
+              <div className="flex gap-1">{deltaDetail.tags.map(tag => (
+                <span key={tag} className="text-[9px] px-1.5 py-0.5 rounded bg-indigo-500/15 text-indigo-300 border border-indigo-500/20">{tag}</span>
+              ))}</div>
+            )}
           </div>
           <button onClick={close} className="text-zinc-500 hover:text-zinc-200 text-xl leading-none px-2">✕</button>
         </div>
@@ -515,6 +859,8 @@ function DetailModal() {
             <div className="w-full bg-zinc-950 rounded-lg p-2">{chartSvg}</div>
           )}
         </div>
+
+        {/* Basic Metrics */}
         <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 p-4 border-t border-zinc-800">
           <MetricBox label="Price" value={`$${fmtPrice(row.current_price)}`} />
           <MetricBox label="24h Change"
@@ -523,7 +869,182 @@ function DetailModal() {
           <MetricBox label="24h High" value={`$${fmtPrice(row.high_24h)}`} />
           <MetricBox label="24h Low" value={`$${fmtPrice(row.low_24h)}`} />
           <MetricBox label="Volume 24h" value={`$${fmt(row.volume_24h, 0)}`} />
+          {row.exchange === 'delta' && (
+            <MetricBox label="Type" value={row.contract_type || '—'} />
+          )}
+          {row.exchange === 'delta' && row.mark_price != null && (
+            <MetricBox label="Mark Price" value={`$${fmtPrice(row.mark_price)}`} />
+          )}
+          {row.exchange === 'delta' && row.open_interest_usd != null && row.open_interest_usd > 0 && (
+            <MetricBox label="Open Interest" value={`$${fmt(row.open_interest_usd, 0)}`} />
+          )}
+          {row.exchange === 'delta' && row.oi_change_6h != null && row.oi_change_6h !== 0 && (
+            <MetricBox label="OI Chg 6H" value={`$${fmt(row.oi_change_6h, 0)}`} color={row.oi_change_6h >= 0 ? 'text-emerald-400' : 'text-red-400'} />
+          )}
+          {row.exchange === 'delta' && row.spot_price != null && (
+            <MetricBox label="Spot Price" value={`$${fmtPrice(row.spot_price)}`} />
+          )}
+          {row.exchange === 'delta' && row.basis_pct != null && (
+            <MetricBox label="Basis" value={`${row.basis_pct > 0 ? '+' : ''}${row.basis_pct.toFixed(3)}%`} color={row.basis_pct >= 0 ? 'text-emerald-400' : 'text-red-400'} />
+          )}
+          {row.exchange === 'delta' && row.spread_pct != null && (
+            <MetricBox label="Spread" value={`${row.spread_pct.toFixed(3)}%`} />
+          )}
+          {row.exchange === 'delta' && row.best_bid != null && row.best_ask != null && (
+            <MetricBox label="Bid / Ask" value={`${fmtPrice(row.best_bid)} / ${fmtPrice(row.best_ask)}`} />
+          )}
         </div>
+
+        {/* Delta Products Data (from bulk fetch) */}
+        {row.exchange === 'delta' && (row.annualized_funding != null || row.default_leverage != null) && (
+          <div className="px-4 pb-3">
+            <h4 className="text-[10px] font-semibold text-zinc-500 uppercase tracking-wider mb-2">📋 Contract Info</h4>
+            <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
+              {row.annualized_funding != null && (
+                <MetricBox label="Annual Funding" value={`${row.annualized_funding > 0 ? '+' : ''}${row.annualized_funding.toFixed(2)}%`}
+                  color={row.annualized_funding >= 0 ? 'text-emerald-400' : 'text-red-400'} />
+              )}
+              {row.default_leverage != null && (
+                <MetricBox label="Default Leverage" value={`${row.default_leverage}x`} color="text-yellow-400" />
+              )}
+              {row.initial_margin != null && (
+                <MetricBox label="Initial Margin" value={`${row.initial_margin}%`} />
+              )}
+              {row.maintenance_margin != null && (
+                <MetricBox label="Maint. Margin" value={`${row.maintenance_margin}%`} />
+              )}
+              {row.maker_fee != null && (
+                <MetricBox label="Maker Fee" value={`${(row.maker_fee * 100).toFixed(3)}%`} />
+              )}
+              {row.taker_fee != null && (
+                <MetricBox label="Taker Fee" value={`${(row.taker_fee * 100).toFixed(3)}%`} />
+              )}
+              {row.contract_value != null && (
+                <MetricBox label="Contract Value" value={`${row.contract_value}`} />
+              )}
+              {row.tick_size != null && (
+                <MetricBox label="Tick Size" value={`${row.tick_size}`} />
+              )}
+            </div>
+            {row.constituent_exchanges?.length > 0 && (
+              <div className="mt-2 flex items-center gap-1.5">
+                <span className="text-[9px] text-zinc-600 uppercase">Index Sources:</span>
+                {row.constituent_exchanges.map(ex => (
+                  <span key={ex} className="text-[9px] px-1.5 py-0.5 rounded bg-zinc-800 text-zinc-400 border border-zinc-700/30">{ex}</span>
+                ))}
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* On-Demand Delta Detail Data */}
+        {row.exchange === 'delta' && detailLoading && (
+          <div className="px-4 pb-3 text-xs text-zinc-600 anim-pulse">Loading funding rate, orderbook depth, recent trades…</div>
+        )}
+
+        {/* Funding Rate & Ticker Detail */}
+        {deltaDetail && (
+          <div className="px-4 pb-3">
+            <h4 className="text-[10px] font-semibold text-zinc-500 uppercase tracking-wider mb-2">⚡ Live Ticker Detail</h4>
+            <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
+              {deltaDetail.funding_rate != null && (
+                <MetricBox label="Funding Rate" value={`${(deltaDetail.funding_rate * 100).toFixed(4)}%`}
+                  color={deltaDetail.funding_rate >= 0 ? 'text-emerald-400' : 'text-red-400'} />
+              )}
+              {deltaDetail.mark_basis != null && (
+                <MetricBox label="Mark Basis" value={`${(deltaDetail.mark_basis * 100).toFixed(4)}%`}
+                  color={deltaDetail.mark_basis >= 0 ? 'text-emerald-400' : 'text-red-400'} />
+              )}
+              {deltaDetail.open_price != null && (
+                <MetricBox label="Open Price" value={`$${fmtPrice(deltaDetail.open_price)}`} />
+              )}
+              {deltaDetail.volume_base != null && (
+                <MetricBox label="Volume (Base)" value={fmt(deltaDetail.volume_base, 2)} />
+              )}
+              {deltaDetail.size_contracts != null && (
+                <MetricBox label="Contracts" value={fmt(deltaDetail.size_contracts, 0)} />
+              )}
+              {deltaDetail.leverage != null && (
+                <MetricBox label="Max Leverage" value={`${deltaDetail.leverage}x`} color="text-yellow-400" />
+              )}
+            </div>
+          </div>
+        )}
+
+        {/* Orderbook Depth */}
+        {orderbook && (
+          <div className="px-4 pb-3">
+            <h4 className="text-[10px] font-semibold text-zinc-500 uppercase tracking-wider mb-2">📊 Orderbook Depth (Top 20 Levels)</h4>
+            <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 mb-2">
+              <MetricBox label="Bid Depth" value={fmt(orderbook.bid_depth_20, 0)} color="text-emerald-400" />
+              <MetricBox label="Ask Depth" value={fmt(orderbook.ask_depth_20, 0)} color="text-red-400" />
+              <MetricBox label="Bid/Ask Ratio" value={orderbook.bid_ask_ratio ?? '—'}
+                color={orderbook.bid_ask_ratio > 1 ? 'text-emerald-400' : orderbook.bid_ask_ratio < 1 ? 'text-red-400' : 'text-zinc-200'} />
+              <MetricBox label="Imbalance" value={orderbook.imbalance != null ? `${orderbook.imbalance > 0 ? '+' : ''}${orderbook.imbalance}%` : '—'}
+                color={orderbook.imbalance > 0 ? 'text-emerald-400' : orderbook.imbalance < 0 ? 'text-red-400' : 'text-zinc-200'} />
+            </div>
+            {/* Visual depth bar */}
+            {orderbook.bid_depth_20 > 0 && orderbook.ask_depth_20 > 0 && (
+              <div className="flex items-center gap-1 h-4 rounded overflow-hidden mb-2">
+                <div className="h-full bg-emerald-500/30 rounded-l" style={{ width: `${(orderbook.bid_depth_20 / (orderbook.bid_depth_20 + orderbook.ask_depth_20)) * 100}%` }}>
+                  <div className="text-[8px] text-emerald-300 px-1 leading-4 whitespace-nowrap">Bids {((orderbook.bid_depth_20 / (orderbook.bid_depth_20 + orderbook.ask_depth_20)) * 100).toFixed(0)}%</div>
+                </div>
+                <div className="h-full bg-red-500/30 rounded-r flex-1">
+                  <div className="text-[8px] text-red-300 px-1 leading-4 text-right whitespace-nowrap">Asks {((orderbook.ask_depth_20 / (orderbook.bid_depth_20 + orderbook.ask_depth_20)) * 100).toFixed(0)}%</div>
+                </div>
+              </div>
+            )}
+            {/* Walls */}
+            {(orderbook.bid_walls.length > 0 || orderbook.ask_walls.length > 0) && (
+              <div className="flex flex-wrap gap-2">
+                {orderbook.bid_walls.map((w, i) => (
+                  <span key={'bw'+i} className="text-[9px] px-1.5 py-0.5 rounded bg-emerald-500/10 text-emerald-400 border border-emerald-500/20">
+                    🟢 Bid wall ${fmtPrice(w.price)} ({fmt(w.size, 0)} contracts)
+                  </span>
+                ))}
+                {orderbook.ask_walls.map((w, i) => (
+                  <span key={'aw'+i} className="text-[9px] px-1.5 py-0.5 rounded bg-red-500/10 text-red-400 border border-red-500/20">
+                    🔴 Ask wall ${fmtPrice(w.price)} ({fmt(w.size, 0)} contracts)
+                  </span>
+                ))}
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* Recent Trades / Buy-Sell Pressure */}
+        {recentTrades && (
+          <div className="px-4 pb-4">
+            <h4 className="text-[10px] font-semibold text-zinc-500 uppercase tracking-wider mb-2">🔥 Recent Trades Pressure ({recentTrades.total_trades} trades)</h4>
+            <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 mb-2">
+              <MetricBox label="Buy Volume" value={fmt(recentTrades.buy_volume, 0)} color="text-emerald-400" />
+              <MetricBox label="Sell Volume" value={fmt(recentTrades.sell_volume, 0)} color="text-red-400" />
+              <MetricBox label="Buy %" value={`${recentTrades.buy_pct}%`} color={recentTrades.buy_pct > 50 ? 'text-emerald-400' : 'text-red-400'} />
+              <MetricBox label="Net Flow" value={fmt(recentTrades.net_flow, 0)}
+                color={recentTrades.net_flow > 0 ? 'text-emerald-400' : recentTrades.net_flow < 0 ? 'text-red-400' : 'text-zinc-200'} />
+            </div>
+            {/* Visual buy/sell bar */}
+            <div className="flex items-center gap-1 h-4 rounded overflow-hidden mb-2">
+              <div className="h-full bg-emerald-500/30 rounded-l" style={{ width: `${recentTrades.buy_pct}%` }}>
+                <div className="text-[8px] text-emerald-300 px-1 leading-4 whitespace-nowrap">Buys {recentTrades.buy_pct}%</div>
+              </div>
+              <div className="h-full bg-red-500/30 rounded-r flex-1">
+                <div className="text-[8px] text-red-300 px-1 leading-4 text-right whitespace-nowrap">Sells {recentTrades.sell_pct}%</div>
+              </div>
+            </div>
+            {/* Big trades */}
+            {recentTrades.big_trades.length > 0 && (
+              <div className="space-y-0.5">
+                <div className="text-[9px] text-zinc-600 uppercase mb-1">Large Trades (3x avg size)</div>
+                {recentTrades.big_trades.map((t, i) => (
+                  <div key={i} className={`text-[10px] px-2 py-1 rounded ${t.side === 'buy' ? 'bg-emerald-500/5 text-emerald-400' : 'bg-red-500/5 text-red-400'}`}>
+                    {t.side === 'buy' ? '🟢' : '🔴'} {t.side.toUpperCase()} — {fmt(t.size, 0)} contracts @ ${fmtPrice(t.price)}
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        )}
       </div>
     </div>
   );
@@ -691,6 +1212,706 @@ function useBinanceWebSocket() {
   return connected;
 }
 
+/* ══════════════════════════════════════════════════════════
+   AI SETUP ENGINE — Elliott Wave + FVG + Trade Planning
+   ══════════════════════════════════════════════════════════ */
+
+/* ── Swing Point Detection ──────────────────────────────── */
+function findSwingPoints(candles, lookback = 3) {
+  const swings = [];
+  for (let i = lookback; i < candles.length - lookback; i++) {
+    let isHigh = true, isLow = true;
+    for (let j = 1; j <= lookback; j++) {
+      if (candles[i].high <= candles[i - j].high || candles[i].high <= candles[i + j].high) isHigh = false;
+      if (candles[i].low >= candles[i - j].low || candles[i].low >= candles[i + j].low) isLow = false;
+    }
+    if (isHigh) swings.push({ type: 'high', price: candles[i].high, idx: i, ts: candles[i].ts });
+    if (isLow) swings.push({ type: 'low', price: candles[i].low, idx: i, ts: candles[i].ts });
+  }
+  return swings;
+}
+
+/* ── Elliott Wave Detection (4H) ────────────────────────── */
+function detectElliottWave(candles) {
+  if (!candles || candles.length < 30) return { structure: 'unclear', count: 'N/A', current_wave: 'Insufficient data', confidence: 'Low', invalidation_level: 0 };
+
+  const swings = findSwingPoints(candles, 3);
+  if (swings.length < 5) return { structure: 'unclear', count: 'N/A', current_wave: 'Too few swing points', confidence: 'Low', invalidation_level: 0 };
+
+  // Merge consecutive same-type swings keeping extreme
+  const merged = [];
+  for (const sw of swings) {
+    if (merged.length && merged[merged.length - 1].type === sw.type) {
+      const prev = merged[merged.length - 1];
+      if ((sw.type === 'high' && sw.price > prev.price) || (sw.type === 'low' && sw.price < prev.price)) {
+        merged[merged.length - 1] = sw;
+      }
+    } else {
+      merged.push({ ...sw });
+    }
+  }
+
+  // Need alternating H-L or L-H sequence
+  const alt = [];
+  for (const sw of merged) {
+    if (!alt.length || alt[alt.length - 1].type !== sw.type) alt.push(sw);
+    else {
+      const prev = alt[alt.length - 1];
+      if ((sw.type === 'high' && sw.price > prev.price) || (sw.type === 'low' && sw.price < prev.price))
+        alt[alt.length - 1] = sw;
+    }
+  }
+
+  // Try impulse (bullish 1-2-3-4-5)
+  function tryBullishImpulse(pts) {
+    for (let start = 0; start <= pts.length - 6; start++) {
+      // Need: L H L H L H pattern (wave 0,1,2,3,4,5)
+      const seq = pts.slice(start, start + 8); // look for pattern
+      const lows = seq.filter(p => p.type === 'low');
+      const highs = seq.filter(p => p.type === 'high');
+      if (lows.length < 3 || highs.length < 3) continue;
+
+      // Check basic rules: W0 < W1, W2 > W0, W2 < W1, W3 > W1, W4 > W2, W4 < W3, W5 > W3
+      const w0 = lows[0], w1 = highs[0], w2 = lows[1], w3 = highs[1], w4 = lows[2], w5 = highs.length >= 3 ? highs[2] : null;
+
+      if (w1.price > w0.price && w2.price > w0.price && w2.price < w1.price && w3.price > w1.price && w4.price > w2.price && w4.price < w3.price) {
+        if (w5 && w5.price > w3.price) {
+          return { structure: 'impulse', count: '1-2-3-4-5', current_wave: 'Wave 5 complete — watch for A-B-C correction', confidence: 'Medium', invalidation_level: w4.price, waves: [w0, w1, w2, w3, w4, w5] };
+        }
+        // In wave 5
+        const lastPrice = candles[candles.length - 1].close;
+        if (lastPrice > w3.price) {
+          return { structure: 'impulse', count: '1-2-3-4-5', current_wave: 'Wave 5 in progress (above Wave 3 high)', confidence: 'Medium', invalidation_level: w4.price, waves: [w0, w1, w2, w3, w4] };
+        }
+        // In wave 4
+        return { structure: 'impulse', count: '1-2-3-4', current_wave: 'Wave 4 pullback — potential Wave 5 rally ahead', confidence: 'Medium', invalidation_level: w2.price, waves: [w0, w1, w2, w3, w4] };
+      }
+    }
+    return null;
+  }
+
+  // Try bearish impulse
+  function tryBearishImpulse(pts) {
+    for (let start = 0; start <= pts.length - 6; start++) {
+      const seq = pts.slice(start);
+      const highs = seq.filter(p => p.type === 'high');
+      const lows = seq.filter(p => p.type === 'low');
+      if (highs.length < 3 || lows.length < 3) continue;
+
+      const w0 = highs[0], w1 = lows[0], w2 = highs[1], w3 = lows[1], w4 = highs[2], w5 = lows.length >= 3 ? lows[2] : null;
+
+      if (w1.price < w0.price && w2.price < w0.price && w2.price > w1.price && w3.price < w1.price && w4.price < w2.price && w4.price > w3.price) {
+        if (w5 && w5.price < w3.price) {
+          return { structure: 'impulse', count: '1-2-3-4-5 (bearish)', current_wave: 'Bearish Wave 5 complete — potential reversal', confidence: 'Medium', invalidation_level: w4.price, waves: [w0, w1, w2, w3, w4, w5] };
+        }
+        const lastPrice = candles[candles.length - 1].close;
+        if (lastPrice < w3.price) {
+          return { structure: 'impulse', count: '1-2-3-4-5 (bearish)', current_wave: 'Bearish Wave 5 in progress', confidence: 'Medium', invalidation_level: w4.price, waves: [w0, w1, w2, w3, w4] };
+        }
+        return { structure: 'impulse', count: '1-2-3-4 (bearish)', current_wave: 'Bearish Wave 4 retrace — potential Wave 5 drop', confidence: 'Medium', invalidation_level: w2.price, waves: [w0, w1, w2, w3, w4] };
+      }
+    }
+    return null;
+  }
+
+  // Try A-B-C correction
+  function tryABC(pts) {
+    if (pts.length < 3) return null;
+    const last3 = pts.slice(-4);
+    if (last3.length < 3) return null;
+
+    // Bullish ABC (upward correction): H-L-H
+    for (let i = 0; i <= last3.length - 3; i++) {
+      const [a, b, c] = [last3[i], last3[i + 1], last3[i + 2]];
+      if (a.type === 'high' && b.type === 'low' && c.type === 'high') {
+        if (b.price < a.price && c.price < a.price && c.price > b.price) {
+          return { structure: 'abc', count: 'A-B-C', current_wave: 'Corrective Wave C completing — bearish continuation likely', confidence: 'Medium', invalidation_level: a.price };
+        }
+      }
+      // Bearish ABC: L-H-L
+      if (a.type === 'low' && b.type === 'high' && c.type === 'low') {
+        if (b.price > a.price && c.price > a.price && c.price < b.price) {
+          return { structure: 'abc', count: 'A-B-C', current_wave: 'Corrective Wave C completing — bullish continuation likely', confidence: 'Medium', invalidation_level: a.price };
+        }
+      }
+    }
+    return null;
+  }
+
+  // Try all patterns
+  let result = tryBullishImpulse(alt) || tryBearishImpulse(alt) || tryABC(alt);
+
+  if (!result) {
+    // Check basic trend for simple classification
+    const recentClose = candles.slice(-10);
+    const trend = recentClose[recentClose.length - 1].close - recentClose[0].close;
+    const volatility = Math.max(...recentClose.map(c => c.high)) - Math.min(...recentClose.map(c => c.low));
+    const avgRange = recentClose.reduce((s, c) => s + (c.high - c.low), 0) / recentClose.length;
+
+    if (alt.length >= 3) {
+      const last = alt.slice(-3);
+      return {
+        structure: 'unclear',
+        count: `${alt.length} swings detected`,
+        current_wave: `Trend ${trend > 0 ? 'bullish' : 'bearish'} bias — structure not clean enough for wave count`,
+        confidence: 'Low',
+        invalidation_level: trend > 0 ? Math.min(...last.map(s => s.price)) : Math.max(...last.map(s => s.price)),
+      };
+    }
+    return { structure: 'unclear', count: 'N/A', current_wave: 'No clear wave structure', confidence: 'Low', invalidation_level: 0 };
+  }
+
+  // Refine confidence based on wave proportions
+  if (result.waves && result.waves.length >= 5) {
+    const w1Len = Math.abs(result.waves[1].price - result.waves[0].price);
+    const w3Len = Math.abs(result.waves[3].price - result.waves[2].price);
+    const w2Retrace = Math.abs(result.waves[2].price - result.waves[1].price) / w1Len;
+    // Wave 3 should be longest, Wave 2 retrace 38-78% of Wave 1
+    if (w3Len > w1Len && w2Retrace >= 0.3 && w2Retrace <= 0.8) {
+      result.confidence = 'High';
+      result.current_wave += ' (Fibonacci-aligned proportions)';
+    }
+  }
+
+  return result;
+}
+
+/* ── Fair Value Gap (FVG) Detection (4H) ────────────────── */
+function detectFVG(candles) {
+  if (!candles || candles.length < 5) return [];
+  const fvgs = [];
+
+  for (let i = 2; i < candles.length; i++) {
+    const c1 = candles[i - 2]; // first candle
+    const c3 = candles[i];     // third candle
+
+    // Bullish FVG: candle1.high < candle3.low → gap up
+    if (c1.high < c3.low) {
+      const low = c1.high;
+      const high = c3.low;
+      fvgs.push({ type: 'bullish', low, high, mid: (low + high) / 2, idx: i, ts: c3.ts, size: high - low });
+    }
+    // Bearish FVG: candle1.low > candle3.high → gap down
+    if (c1.low > c3.high) {
+      const high = c1.low;
+      const low = c3.high;
+      fvgs.push({ type: 'bearish', low, high, mid: (low + high) / 2, idx: i, ts: c3.ts, size: high - low });
+    }
+  }
+
+  // Filter: keep only unfilled FVGs (price hasn't fully closed the gap since)
+  const unfilled = [];
+  for (const fvg of fvgs) {
+    let filled = false;
+    for (let j = fvg.idx + 1; j < candles.length; j++) {
+      if (fvg.type === 'bullish' && candles[j].low <= fvg.low) { filled = true; break; }
+      if (fvg.type === 'bearish' && candles[j].high >= fvg.high) { filled = true; break; }
+    }
+    if (!filled) unfilled.push(fvg);
+  }
+
+  // Sort by recency (most recent first), take top 5
+  return unfilled.sort((a, b) => b.idx - a.idx).slice(0, 5);
+}
+
+/* ── Trade Setup Generator ──────────────────────────────── */
+function generateTradeSetup(symbol, currentPrice, elliott, fvgs, candles) {
+  const result = {
+    symbol,
+    elliott_4h: elliott,
+    fvg_4h: fvgs.map(f => ({
+      type: f.type,
+      low: +f.low.toFixed(8),
+      high: +f.high.toFixed(8),
+      mid: +f.mid.toFixed(8),
+      price_position: currentPrice < f.low ? 'below' : currentPrice > f.high ? 'above' : 'inside',
+    })),
+    long_setup: { status: 'NO TRADE', limit_entry: 0, stop_loss: 0, stop_limit: 0, tp1: 0, tp2: 0, rr_tp1: 0, rr_tp2: 0, reason: '' },
+    short_setup: { status: 'NO TRADE', limit_entry: 0, stop_loss: 0, stop_limit: 0, tp1: 0, tp2: 0, rr_tp1: 0, rr_tp2: 0, reason: '' },
+  };
+
+  if (!candles || candles.length < 10) {
+    result.long_setup.reason = 'Insufficient candle data';
+    result.short_setup.reason = 'Insufficient candle data';
+    return result;
+  }
+
+  // Calculate ATR for stop-limit spacing
+  const atrCalc = candles.slice(-20);
+  const avgTR = atrCalc.reduce((s, c, i) => {
+    if (i === 0) return s;
+    const tr = Math.max(c.high - c.low, Math.abs(c.high - atrCalc[i-1].close), Math.abs(c.low - atrCalc[i-1].close));
+    return s + tr;
+  }, 0) / (atrCalc.length - 1);
+
+  const recent = candles.slice(-30);
+  const recentHigh = Math.max(...recent.map(c => c.high));
+  const recentLow = Math.min(...recent.map(c => c.low));
+  const atr = recent.reduce((s, c) => s + (c.high - c.low), 0) / recent.length;
+  const trueATR = typeof avgTR === 'number' ? avgTR : atr;
+
+  // Find best bullish FVG for longs
+  const bullishFVGs = fvgs.filter(f => f.type === 'bullish' && currentPrice >= f.low);
+  const bearishFVGs = fvgs.filter(f => f.type === 'bearish' && currentPrice <= f.high);
+
+  // LONG SETUP
+  if (bullishFVGs.length > 0) {
+    const bestFVG = bullishFVGs[0]; // most recent unfilled bullish FVG
+    const entry = bestFVG.mid;
+    const sl = bestFVG.low - atr * 0.5;
+    const risk = entry - sl;
+    const tp1 = entry + risk * 2;
+    const tp2 = entry + risk * 3.5;
+
+    // Validate with Elliott context
+    let valid = true;
+    let reason = `Long entry at bullish FVG midpoint $${fmtPrice(entry)}`;
+    if (elliott.structure === 'impulse' && elliott.count.includes('bearish')) {
+      if (elliott.current_wave.includes('Wave 5 in progress')) {
+        valid = false;
+        reason = 'Bearish impulse Wave 5 in progress — counter-trend long too risky';
+      }
+    }
+    if (elliott.structure === 'impulse' && !elliott.count.includes('bearish')) {
+      if (elliott.current_wave.includes('Wave 4 pullback')) {
+        reason += ' — aligned with Wave 4 pullback into FVG for Wave 5 rally';
+      }
+    }
+
+    if (valid && risk > 0) {
+      // Stop-limit: trigger slightly above entry so the limit order only fires when price confirms direction
+      const stopLimitTrigger = +(entry + trueATR * 0.15).toFixed(8);
+      result.long_setup = {
+        status: 'TRADE',
+        limit_entry: +entry.toFixed(8),
+        stop_loss: +sl.toFixed(8),
+        stop_limit: stopLimitTrigger,
+        tp1: +tp1.toFixed(8),
+        tp2: +tp2.toFixed(8),
+        rr_tp1: +((tp1 - entry) / risk).toFixed(2),
+        rr_tp2: +((tp2 - entry) / risk).toFixed(2),
+        reason,
+      };
+    } else {
+      result.long_setup = { status: 'NO TRADE', limit_entry: 0, stop_loss: 0, stop_limit: 0, tp1: 0, tp2: 0, rr_tp1: 0, rr_tp2: 0, reason };
+    }
+  } else {
+    result.long_setup.reason = 'No valid unfilled bullish FVG near current price';
+  }
+
+  // SHORT SETUP
+  if (bearishFVGs.length > 0) {
+    const bestFVG = bearishFVGs[0];
+    const entry = bestFVG.mid;
+    const sl = bestFVG.high + atr * 0.5;
+    const risk = sl - entry;
+    const tp1 = entry - risk * 2;
+    const tp2 = entry - risk * 3.5;
+
+    let valid = true;
+    let reason = `Short entry at bearish FVG midpoint $${fmtPrice(entry)}`;
+    if (elliott.structure === 'impulse' && !elliott.count.includes('bearish')) {
+      if (elliott.current_wave.includes('Wave 5 in progress') || elliott.current_wave.includes('Wave 4 pullback')) {
+        valid = false;
+        reason = 'Bullish impulse in progress — counter-trend short too risky';
+      }
+    }
+    if (elliott.structure === 'impulse' && elliott.count.includes('bearish')) {
+      if (elliott.current_wave.includes('Wave 4 retrace')) {
+        reason += ' — aligned with bearish Wave 4 retrace into FVG for Wave 5 drop';
+      }
+    }
+
+    if (valid && risk > 0) {
+      // Stop-limit: trigger slightly below entry so the limit order only fires when price confirms direction
+      const stopLimitTrigger = +(entry - trueATR * 0.15).toFixed(8);
+      result.short_setup = {
+        status: 'TRADE',
+        limit_entry: +entry.toFixed(8),
+        stop_loss: +sl.toFixed(8),
+        stop_limit: stopLimitTrigger,
+        tp1: +tp1.toFixed(8),
+        tp2: +tp2.toFixed(8),
+        rr_tp1: +((entry - tp1) / risk).toFixed(2),
+        rr_tp2: +((entry - tp2) / risk).toFixed(2),
+        reason,
+      };
+    } else {
+      result.short_setup = { status: 'NO TRADE', limit_entry: 0, stop_loss: 0, stop_limit: 0, tp1: 0, tp2: 0, rr_tp1: 0, rr_tp2: 0, reason };
+    }
+  } else {
+    result.short_setup.reason = 'No valid unfilled bearish FVG near current price';
+  }
+
+  return result;
+}
+
+/* ── Full AI Analysis Pipeline ──────────────────────────── */
+async function runAIAnalysis(symbols, progressCb, exchangeFilter = 'all') {
+  // If exchange filter is set, only analyze coins from that exchange
+  let pool = [...symbols];
+  if (exchangeFilter === 'delta') pool = pool.filter(s => s.exchange === 'delta');
+  else if (exchangeFilter === 'binance') pool = pool.filter(s => s.exchange === 'binance');
+
+  // Pick top candidates: highest |change%| with decent volume
+  const minVol = exchangeFilter === 'delta' ? 50000 : 500000;
+  const maxCandidates = exchangeFilter === 'all' ? 15 : 20;
+  const candidates = pool
+    .filter(s => s.raw_symbol && s.volume_24h > minVol)
+    .sort((a, b) => Math.abs(b.price_change_pct_24h ?? 0) - Math.abs(a.price_change_pct_24h ?? 0))
+    .slice(0, maxCandidates);
+
+  const topSetups = [];
+  const excluded = [];
+
+  for (let i = 0; i < candidates.length; i++) {
+    const coin = candidates[i];
+    progressCb && progressCb(`Analyzing ${coin.symbol} (${i + 1}/${candidates.length})…`);
+
+    try {
+      // Fetch 4H OHLCV — use appropriate API based on exchange
+      let candles;
+      if (coin.exchange === 'delta') {
+        candles = await fetchDeltaOHLCV(coin.raw_symbol, '4h', 100);
+      } else {
+        candles = await fetchOHLCV(coin.raw_symbol, '4h', 100);
+      }
+      if (!candles || candles.length < 30) {
+        excluded.push({ symbol: coin.symbol, reason: `Insufficient 4H candle data from ${coin.exchange}` });
+        continue;
+      }
+
+      // Elliott Wave
+      const elliott = detectElliottWave(candles);
+      if (elliott.structure === 'unclear' && elliott.confidence === 'Low') {
+        excluded.push({ symbol: coin.symbol, reason: `Elliott unclear: ${elliott.current_wave}` });
+        continue;
+      }
+
+      // FVG Detection
+      const fvgs = detectFVG(candles);
+      if (fvgs.length === 0) {
+        excluded.push({ symbol: coin.symbol, reason: 'No unfilled FVG found on 4H' });
+        continue;
+      }
+
+      // Generate trade setups
+      const setup = generateTradeSetup(coin.symbol, coin.current_price, elliott, fvgs, candles);
+      topSetups.push(setup);
+    } catch (err) {
+      excluded.push({ symbol: coin.symbol, reason: `Analysis error: ${err.message}` });
+    }
+
+    // Small delay to respect Binance rate limits
+    if (i < candidates.length - 1) await new Promise(r => setTimeout(r, 200));
+  }
+
+  return { top_setups: topSetups, excluded };
+}
+
+/* ── AI Setup Modal Component ───────────────────────────── */
+function AiSetupModal({ open, onClose }) {
+  const symbols = useStore(s => s.symbols);
+  const globalExchange = useStore(s => s.filters.exchange);
+  const [result, setResult] = useState(null);
+  const [loading, setLoading] = useState(false);
+  const [progress, setProgress] = useState('');
+  const [error, setError] = useState(null);
+  const [viewMode, setViewMode] = useState('cards'); // 'cards' | 'json'
+  const [aiExchange, setAiExchange] = useState(globalExchange); // local exchange pick for AI
+
+  // Sync when global filter changes
+  useEffect(() => { setAiExchange(globalExchange); }, [globalExchange]);
+
+  const runAnalysis = useCallback(async () => {
+    setLoading(true);
+    setError(null);
+    setResult(null);
+    setProgress(`Starting analysis (${aiExchange === 'all' ? 'All Exchanges' : aiExchange === 'delta' ? 'Delta Exchange only' : 'Binance only'})…`);
+    try {
+      const res = await runAIAnalysis(symbols, setProgress, aiExchange);
+      setResult(res);
+      setProgress('');
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setLoading(false);
+    }
+  }, [symbols, aiExchange]);
+
+  useEffect(() => {
+    if (open && !result && !loading && symbols.length > 0) runAnalysis();
+  }, [open, symbols.length]);
+
+  useEffect(() => {
+    if (!open) return;
+    const handler = e => { if (e.key === 'Escape') onClose(); };
+    document.addEventListener('keydown', handler);
+    return () => document.removeEventListener('keydown', handler);
+  }, [open, onClose]);
+
+  const exportJSON = () => {
+    if (!result) return;
+    const blob = new Blob([JSON.stringify(result, null, 2)], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url; a.download = `ai_setups_${Date.now()}.json`; a.click();
+    URL.revokeObjectURL(url);
+  };
+
+  if (!open) return null;
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center">
+      <div className="absolute inset-0 bg-black/60 backdrop-blur-sm" onClick={onClose} />
+      <div className="relative z-10 w-full max-w-5xl max-h-[90vh] mx-4 rounded-2xl border border-zinc-700/50 overflow-hidden flex flex-col animate-in"
+        style={{ background: 'linear-gradient(135deg, rgba(15,15,20,0.98), rgba(24,24,30,0.95))', boxShadow: '0 0 0 1px rgba(99,102,241,0.1), 0 20px 50px -8px rgba(0,0,0,0.6), 0 0 80px -20px rgba(99,102,241,0.15)' }}>
+
+        {/* Header */}
+        <div className="flex items-center justify-between px-6 py-4 border-b border-zinc-800/80">
+          <div className="flex items-center gap-3">
+            <div className="w-8 h-8 rounded-lg bg-purple-600/20 flex items-center justify-center"><span className="text-lg">🤖</span></div>
+            <div>
+              <h2 className="text-sm font-bold text-zinc-100">AI Trade Setup — Elliott Wave + FVG</h2>
+              <p className="text-[10px] text-zinc-500">4H candle analysis · Stop-Limit entries · Binance + Delta Exchange OHLCV · No API key required</p>
+            </div>
+          </div>
+          <div className="flex items-center gap-2">
+            {/* Exchange picker for AI */}
+            <div className="flex items-center gap-0.5 bg-zinc-800/80 rounded-lg p-0.5 border border-zinc-700/50 mr-2">
+              {[{v:'all',l:'All',icon:''},{v:'binance',l:'Binance',icon:'🟡'},{v:'delta',l:'Delta',icon:'🔺'}].map(ex => (
+                <button key={ex.v} onClick={() => setAiExchange(ex.v)}
+                  className={`text-[10px] px-2 py-1 rounded-md transition-all ${aiExchange === ex.v ? 'bg-indigo-600/80 text-zinc-100' : 'text-zinc-500 hover:text-zinc-300'}`}>
+                  {ex.icon} {ex.l}
+                </button>
+              ))}
+            </div>
+            {result && (
+              <div className="flex items-center gap-0.5 bg-zinc-800/80 rounded-lg p-0.5 border border-zinc-700/50 mr-2">
+                <button onClick={() => setViewMode('cards')}
+                  className={`text-[10px] px-2.5 py-1 rounded-md transition-all ${viewMode === 'cards' ? 'bg-zinc-600/80 text-zinc-100' : 'text-zinc-500 hover:text-zinc-300'}`}>
+                  📋 Cards
+                </button>
+                <button onClick={() => setViewMode('json')}
+                  className={`text-[10px] px-2.5 py-1 rounded-md transition-all ${viewMode === 'json' ? 'bg-zinc-600/80 text-zinc-100' : 'text-zinc-500 hover:text-zinc-300'}`}>
+                  {'{ }'} JSON
+                </button>
+              </div>
+            )}
+            {result && (
+              <button onClick={exportJSON}
+                className="flex items-center gap-1 text-[10px] px-2.5 py-1 rounded-md bg-indigo-600/20 text-indigo-300 border border-indigo-500/30 hover:bg-indigo-600/30 transition-all">
+                💾 Export
+              </button>
+            )}
+            <button onClick={runAnalysis} disabled={loading}
+              className="flex items-center gap-1.5 text-xs px-3 py-1.5 rounded-md bg-purple-600/20 text-purple-300 border border-purple-500/30 hover:bg-purple-600/30 disabled:opacity-50 disabled:cursor-not-allowed transition-all">
+              <svg className={`w-3 h-3 ${loading ? 'anim-spin' : ''}`} fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                <path strokeLinecap="round" strokeLinejoin="round" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
+              </svg>
+              {loading ? 'Analyzing…' : 'Re-analyze'}
+            </button>
+            <button onClick={onClose} className="text-zinc-500 hover:text-zinc-200 text-xl leading-none px-2 py-1 hover:bg-zinc-800 rounded transition-colors">✕</button>
+          </div>
+        </div>
+
+        {/* Content */}
+        <div className="flex-1 overflow-y-auto px-6 py-4">
+          {loading && <AiLoadingSkeleton progress={progress} />}
+          {error && (
+            <div className="flex items-center gap-3 p-4 rounded-lg bg-red-500/10 border border-red-500/20">
+              <span className="text-red-400 text-lg">⚠️</span>
+              <div><div className="text-sm font-medium text-red-300">Analysis Failed</div><div className="text-xs text-red-400/80 mt-0.5">{error}</div></div>
+            </div>
+          )}
+          {result && !loading && viewMode === 'cards' && <AiResultCards result={result} />}
+          {result && !loading && viewMode === 'json' && (
+            <pre className="text-[11px] text-zinc-300 bg-zinc-950 rounded-lg p-4 overflow-auto max-h-[70vh] whitespace-pre-wrap">{JSON.stringify(result, null, 2)}</pre>
+          )}
+        </div>
+
+        {/* Footer */}
+        <div className="px-6 py-3 border-t border-zinc-800/80 flex items-center justify-between">
+          <span className="text-[10px] text-zinc-600">⚡ Algorithmic analysis — not financial advice</span>
+          {result && <span className="text-[10px] text-zinc-600">{result.top_setups.length} setups · {result.excluded.length} excluded</span>}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function AiLoadingSkeleton({ progress }) {
+  return (
+    <div className="space-y-4">
+      <div className="flex items-center gap-3 mb-6">
+        <svg className="w-5 h-5 anim-spin text-purple-400" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+          <path strokeLinecap="round" strokeLinejoin="round" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
+        </svg>
+        <div>
+          <div className="text-sm font-medium text-zinc-300">{progress || 'Initializing…'}</div>
+          <div className="text-[10px] text-zinc-600 mt-0.5">Fetching 4H candles, detecting Elliott Waves & FVGs…</div>
+        </div>
+      </div>
+      {[1,2,3].map(i => (
+        <div key={i} className="rounded-lg bg-zinc-800/30 p-4 space-y-2" style={{animation: `pulse 2s cubic-bezier(0.4,0,0.6,1) infinite`, animationDelay: `${i * 200}ms`}}>
+          <div className="h-4 w-48 bg-zinc-800 rounded" />
+          <div className="h-3 w-full bg-zinc-800/60 rounded" />
+          <div className="h-3 w-3/4 bg-zinc-800/40 rounded" />
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function AiResultCards({ result }) {
+  return (
+    <div className="space-y-6">
+      {/* Summary */}
+      <div className="flex items-center gap-4 mb-2">
+        <div className="flex items-center gap-2 px-3 py-1.5 rounded-lg bg-emerald-500/10 border border-emerald-500/20">
+          <span className="text-sm">✅</span>
+          <span className="text-xs text-emerald-400 font-medium">{result.top_setups.length} trade setups found</span>
+        </div>
+        <div className="flex items-center gap-2 px-3 py-1.5 rounded-lg bg-zinc-800/50 border border-zinc-700/30">
+          <span className="text-sm">🚫</span>
+          <span className="text-xs text-zinc-400 font-medium">{result.excluded.length} excluded</span>
+        </div>
+      </div>
+
+      {/* Setup Cards */}
+      {result.top_setups.map((setup, i) => (
+        <SetupCard key={setup.symbol} setup={setup} index={i} />
+      ))}
+
+      {/* Excluded */}
+      {result.excluded.length > 0 && (
+        <div className="mt-6">
+          <h3 className="text-xs font-semibold text-zinc-500 uppercase tracking-wider mb-2">Excluded Coins</h3>
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-1.5">
+            {result.excluded.map((ex, i) => (
+              <div key={i} className="flex items-center gap-2 px-3 py-2 rounded bg-zinc-800/30 text-[11px]">
+                <span className="text-zinc-500 font-mono font-bold">{ex.symbol}</span>
+                <span className="text-zinc-600">— {ex.reason}</span>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function SetupCard({ setup, index }) {
+  const [expanded, setExpanded] = useState(index < 3);
+  const ew = setup.elliott_4h;
+  const confColor = ew.confidence === 'High' ? 'text-emerald-400 bg-emerald-500/10 border-emerald-500/20' :
+    ew.confidence === 'Medium' ? 'text-amber-400 bg-amber-500/10 border-amber-500/20' :
+    'text-zinc-400 bg-zinc-700/30 border-zinc-600/30';
+
+  return (
+    <div className="rounded-xl border border-zinc-700/40 overflow-hidden" style={{ background: 'linear-gradient(135deg, rgba(24,24,27,0.95), rgba(39,39,42,0.9))' }}>
+      {/* Card Header */}
+      <button onClick={() => setExpanded(v => !v)} className="w-full flex items-center justify-between px-5 py-3 hover:bg-zinc-800/30 transition-colors">
+        <div className="flex items-center gap-3">
+          <span className="text-base font-bold text-zinc-100 font-mono">{setup.symbol}</span>
+          <span className={`text-[10px] px-2 py-0.5 rounded-full border font-medium ${confColor}`}>
+            {ew.confidence} · {ew.structure}
+          </span>
+          <span className="text-[10px] px-1.5 py-0.5 rounded bg-zinc-800 text-zinc-500 border border-zinc-700/30">
+            {setup.symbol.startsWith('Δ') ? '🔺 Delta' : '🟡 Binance'}
+          </span>
+          {setup.long_setup.status === 'TRADE' && <span className="text-[10px] px-1.5 py-0.5 rounded bg-emerald-500/15 text-emerald-400 border border-emerald-500/20">LONG ✓</span>}
+          {setup.short_setup.status === 'TRADE' && <span className="text-[10px] px-1.5 py-0.5 rounded bg-red-500/15 text-red-400 border border-red-500/20">SHORT ✓</span>}
+        </div>
+        <span className="text-zinc-500 text-sm">{expanded ? '▲' : '▼'}</span>
+      </button>
+
+      {expanded && (
+        <div className="px-5 pb-4 space-y-4">
+          {/* Elliott Wave */}
+          <div className="rounded-lg bg-zinc-900/60 p-3 border border-zinc-800/50">
+            <h4 className="text-[10px] font-semibold text-zinc-500 uppercase tracking-wider mb-2">📊 Elliott Wave (4H)</h4>
+            <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
+              <div><div className="text-[9px] text-zinc-600 uppercase">Structure</div><div className="text-xs font-mono text-zinc-200">{ew.structure}</div></div>
+              <div><div className="text-[9px] text-zinc-600 uppercase">Count</div><div className="text-xs font-mono text-zinc-200">{ew.count}</div></div>
+              <div><div className="text-[9px] text-zinc-600 uppercase">Confidence</div><div className={`text-xs font-mono font-bold ${ew.confidence === 'High' ? 'text-emerald-400' : ew.confidence === 'Medium' ? 'text-amber-400' : 'text-zinc-400'}`}>{ew.confidence}</div></div>
+              <div><div className="text-[9px] text-zinc-600 uppercase">Invalidation</div><div className="text-xs font-mono text-red-400">${fmtPrice(ew.invalidation_level)}</div></div>
+            </div>
+            <div className="mt-2 text-[11px] text-zinc-400">💡 {ew.current_wave}</div>
+          </div>
+
+          {/* FVG Zones */}
+          {setup.fvg_4h.length > 0 && (
+            <div className="rounded-lg bg-zinc-900/60 p-3 border border-zinc-800/50">
+              <h4 className="text-[10px] font-semibold text-zinc-500 uppercase tracking-wider mb-2">🎯 Fair Value Gaps (4H)</h4>
+              <div className="space-y-1.5">
+                {setup.fvg_4h.map((fvg, j) => (
+                  <div key={j} className={`flex items-center gap-3 px-3 py-1.5 rounded text-[11px] ${fvg.type === 'bullish' ? 'bg-emerald-500/5 border border-emerald-500/10' : 'bg-red-500/5 border border-red-500/10'}`}>
+                    <span className={`font-bold font-mono ${fvg.type === 'bullish' ? 'text-emerald-400' : 'text-red-400'}`}>{fvg.type.toUpperCase()}</span>
+                    <span className="text-zinc-400">Zone: <span className="text-zinc-200 font-mono">${fmtPrice(fvg.low)} — ${fmtPrice(fvg.high)}</span></span>
+                    <span className="text-zinc-400">Mid: <span className="text-zinc-200 font-mono">${fmtPrice(fvg.mid)}</span></span>
+                    <span className={`ml-auto px-1.5 py-0.5 rounded text-[9px] font-medium ${fvg.price_position === 'inside' ? 'bg-amber-500/15 text-amber-400' : 'bg-zinc-700/50 text-zinc-400'}`}>{fvg.price_position}</span>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+
+          {/* Trade Plans */}
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+            <TradePlanCard plan={setup.long_setup} type="LONG" />
+            <TradePlanCard plan={setup.short_setup} type="SHORT" />
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function TradePlanCard({ plan, type }) {
+  const isLong = type === 'LONG';
+  const isTrade = plan.status === 'TRADE';
+  const borderColor = isTrade ? (isLong ? 'border-emerald-500/30' : 'border-red-500/30') : 'border-zinc-700/30';
+  const bgColor = isTrade ? (isLong ? 'bg-emerald-500/5' : 'bg-red-500/5') : 'bg-zinc-800/20';
+
+  return (
+    <div className={`rounded-lg p-3 border ${borderColor} ${bgColor}`}>
+      <div className="flex items-center justify-between mb-2">
+        <span className={`text-xs font-bold ${isLong ? 'text-emerald-400' : 'text-red-400'}`}>
+          {isLong ? '🟢' : '🔴'} {type}
+        </span>
+        <span className={`text-[10px] px-2 py-0.5 rounded-full font-medium border ${
+          isTrade ? (isLong ? 'bg-emerald-500/15 text-emerald-400 border-emerald-500/20' : 'bg-red-500/15 text-red-400 border-red-500/20')
+            : 'bg-zinc-700/30 text-zinc-500 border-zinc-600/20'
+        }`}>{plan.status}</span>
+      </div>
+      {isTrade ? (
+        <div className="space-y-1.5">
+          <div className="grid grid-cols-2 gap-2">
+            <div><div className="text-[9px] text-zinc-600 uppercase">Limit Entry</div><div className="text-xs font-mono text-zinc-200">${fmtPrice(plan.limit_entry)}</div></div>
+            <div><div className="text-[9px] text-zinc-600 uppercase">Stop-Limit Trigger</div><div className="text-xs font-mono text-amber-400">${fmtPrice(plan.stop_limit)}</div></div>
+            <div><div className="text-[9px] text-zinc-600 uppercase">Stop Loss</div><div className="text-xs font-mono text-red-400">${fmtPrice(plan.stop_loss)}</div></div>
+            <div><div className="text-[9px] text-zinc-600 uppercase">Risk (Entry → SL)</div><div className="text-xs font-mono text-red-300">${fmtPrice(Math.abs(plan.limit_entry - plan.stop_loss))}</div></div>
+            <div><div className="text-[9px] text-zinc-600 uppercase">TP1</div><div className="text-xs font-mono text-emerald-400">${fmtPrice(plan.tp1)}</div></div>
+            <div><div className="text-[9px] text-zinc-600 uppercase">TP2</div><div className="text-xs font-mono text-emerald-400">${fmtPrice(plan.tp2)}</div></div>
+          </div>
+          <div className="flex gap-3 mt-1">
+            <span className="text-[10px] text-zinc-500">R:R TP1 <span className="text-amber-400 font-bold">{plan.rr_tp1}:1</span></span>
+            <span className="text-[10px] text-zinc-500">R:R TP2 <span className="text-amber-400 font-bold">{plan.rr_tp2}:1</span></span>
+          </div>
+          <div className="text-[10px] text-zinc-500 mt-1 space-y-0.5">
+            <div>📌 <span className="text-zinc-400">Place a <b>stop-limit {isLong ? 'buy' : 'sell'} order</b>: trigger at <span className="text-amber-400 font-mono">${fmtPrice(plan.stop_limit)}</span>, limit price <span className="text-zinc-200 font-mono">${fmtPrice(plan.limit_entry)}</span></span></div>
+            <div>🛑 <span className="text-zinc-400">Set stop-loss at <span className="text-red-400 font-mono">${fmtPrice(plan.stop_loss)}</span></span></div>
+            <div>💡 {plan.reason}</div>
+          </div>
+        </div>
+      ) : (
+        <div className="text-[10px] text-zinc-500 italic">{plan.reason}</div>
+      )}
+    </div>
+  );
+}
+
 /* ── Main App Component ─────────────────────────────────── */
 function App() {
   const [tab, setTab] = useState('table');
@@ -698,30 +1919,68 @@ function App() {
   const [refreshing, setRefreshing] = useState(false);
   const [lastUpdated, setLastUpdated] = useState(null);
   const [error, setError] = useState(null);
+  const [aiOpen, setAiOpen] = useState(false);
   const alerts = useStore(s => s.symbols).filter(s => s.price_change_pct_24h != null && Math.abs(s.price_change_pct_24h) >= 8);
 
   const wsConnected = useBinanceWebSocket();
 
-  // Load data function
+  // Load data function — fetch from both Binance + Delta Exchange
   const loadData = useCallback(async () => {
     setRefreshing(true);
     setError(null);
     try {
-      const rows = await fetchTicker24h();
-      // Fetch sparklines for top 30 coins in parallel
-      const top30 = rows.slice(0, 30);
+      // Fetch Binance + Delta + Delta Products in parallel
+      const [binanceRows, deltaRows, deltaProducts] = await Promise.all([
+        fetchTicker24h().catch(err => { console.warn('Binance fetch error:', err); return []; }),
+        fetchDeltaTickers().catch(err => { console.warn('Delta fetch error:', err); return []; }),
+        fetchDeltaProducts().catch(err => { console.warn('Delta products error:', err); return {}; }),
+      ]);
+
+      // Enrich delta rows with products data (leverage, fees, funding, etc.)
+      for (const row of deltaRows) {
+        const prod = deltaProducts[row.raw_symbol];
+        if (prod) {
+          row.annualized_funding = prod.annualized_funding;
+          row.default_leverage = prod.default_leverage;
+          row.initial_margin = prod.initial_margin;
+          row.maintenance_margin = prod.maintenance_margin;
+          row.maker_fee = prod.maker_fee;
+          row.taker_fee = prod.taker_fee;
+          row.contract_value = prod.contract_value;
+          row.tick_size = prod.tick_size;
+          row.funding_method = prod.funding_method;
+          row.spot_index_symbol = prod.spot_index_symbol;
+          row.constituent_exchanges = prod.constituent_exchanges;
+        }
+      }
+
+      // Fetch sparklines for top 30 Binance coins in parallel
+      const top30 = binanceRows.slice(0, 30);
       const sparkPromises = top30.map(r =>
         fetchKlines(r.raw_symbol, '1h', 24).then(data => ({ symbol: r.symbol, data })).catch(() => ({ symbol: r.symbol, data: [] }))
       );
-      const sparkResults = await Promise.all(sparkPromises);
-      const sparkMap = new Map(sparkResults.map(s => [s.symbol, s.data]));
+      // Also fetch sparklines for top 20 Delta coins
+      const deltaTop20 = deltaRows.slice(0, 20);
+      const deltaSparkPromises = deltaTop20.map(r =>
+        fetchDeltaKlines(r.raw_symbol, '1h', 24).then(data => ({ symbol: r.symbol, data })).catch(() => ({ symbol: r.symbol, data: [] }))
+      );
 
-      const enriched = rows.map(r => ({
+      const [sparkResults, deltaSparkResults] = await Promise.all([
+        Promise.all(sparkPromises),
+        Promise.all(deltaSparkPromises),
+      ]);
+      const sparkMap = new Map([...sparkResults, ...deltaSparkResults].map(s => [s.symbol, s.data]));
+
+      // Merge & deduplicate — if same base coin exists on both, keep both with exchange tag
+      const allRows = [...binanceRows, ...deltaRows].map(r => ({
         ...r,
         sparkline: sparkMap.get(r.symbol) || r.sparkline,
       }));
 
-      setStore({ symbols: enriched });
+      // Re-assign IDs
+      allRows.forEach((r, i) => r.symbol_id = i + 1);
+
+      setStore({ symbols: allRows });
       setLastUpdated(new Date());
     } catch (err) {
       setError(err.message);
@@ -763,6 +2022,14 @@ function App() {
           </div>
 
           <div className="flex items-center gap-2">
+            {/* AI Setup button */}
+            <button onClick={() => setAiOpen(true)}
+              className="flex items-center gap-1.5 text-xs px-3 py-1.5 rounded-md bg-purple-600/20 text-purple-300 border border-purple-500/30 hover:bg-purple-600/30 hover:border-purple-500/50 hover:text-purple-200 transition-all duration-200 active:scale-95"
+              title="AI Trade Setup — Elliott Wave + FVG Analysis">
+              <span className="text-sm">🤖</span>
+              AI Setup
+            </button>
+
             {/* Refresh button */}
             <button onClick={loadData} disabled={refreshing}
               className="flex items-center gap-1.5 text-xs px-3 py-1.5 rounded-md bg-indigo-600/20 text-indigo-300 border border-indigo-500/30 hover:bg-indigo-600/30 hover:border-indigo-500/50 hover:text-indigo-200 disabled:opacity-50 disabled:cursor-not-allowed transition-all duration-200 active:scale-95"
@@ -827,6 +2094,8 @@ function App() {
       )}
 
       <DetailModal />
+
+      <AiSetupModal open={aiOpen} onClose={() => setAiOpen(false)} />
     </div>
   );
 }
