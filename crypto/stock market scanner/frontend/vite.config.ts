@@ -6,9 +6,9 @@ export default defineConfig({
   plugins: [react(), tailwindcss()],
   server: {
     proxy: {
-      '/scan': 'http://localhost:8000',
-      '/health': 'http://localhost:8000',
-      '/ws': { target: 'ws://localhost:8000', ws: true },
+      '/scan': 'http://api:8000',
+      '/health': 'http://api:8000',
+      '/ws': { target: 'ws://api:8000', ws: true },
     },
   },
 })

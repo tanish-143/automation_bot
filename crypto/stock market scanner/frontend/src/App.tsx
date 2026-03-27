@@ -32,15 +32,15 @@ function App() {
   // Connect WebSocket
   useWebSocket();
 
-  // Initial data fetch — try DB-backed top-movers first, fall back to live CoinGecko prices
+  // Initial data fetch — try DB-backed top-movers first, fall back to live Binance prices
   useEffect(() => {
     api.topMovers({}).then(setSymbols).catch(() => {
-      // DB unavailable — seed store from live CoinGecko data
+      // DB unavailable — seed store from live Binance data
       api.livePrices().then((prices) => {
         const rows = prices.map((p, i) => ({
           symbol_id: i + 1,
           symbol: p.symbol,
-          exchange: 'coingecko',
+          exchange: 'binance',
           asset_class: 'crypto' as const,
           current_price: p.current_price,
           price_change_pct_24h: p.price_change_pct_24h,
@@ -58,7 +58,7 @@ function App() {
     api.alerts({}).then(setAlerts).catch(() => {});
   }, [setSymbols, setAlerts]);
 
-  // Refresh: fetch live prices from CoinGecko and update store
+  // Refresh: fetch live prices from Binance and update store
   const handleRefresh = useCallback(async () => {
     if (refreshing) return;
     setRefreshing(true);
@@ -67,7 +67,7 @@ function App() {
       const rows = prices.map((p, i) => ({
         symbol_id: i + 1,
         symbol: p.symbol,
-        exchange: 'coingecko',
+        exchange: 'binance',
         asset_class: 'crypto' as const,
         current_price: p.current_price,
         price_change_pct_24h: p.price_change_pct_24h,
@@ -134,7 +134,7 @@ function App() {
                 hover:bg-indigo-600/30 hover:border-indigo-500/50 hover:text-indigo-200
                 disabled:opacity-50 disabled:cursor-not-allowed
                 transition-all duration-200 active:scale-95"
-              title="Fetch live prices from CoinGecko"
+              title="Fetch live prices from Binance"
             >
               <svg
                 className={`w-3.5 h-3.5 ${refreshing ? 'animate-spin' : ''}`}

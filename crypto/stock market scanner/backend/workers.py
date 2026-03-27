@@ -1,57 +1,36 @@
 """
-Celery Workers — Scheduled Ingestion & Scan Jobs (CoinGecko)
-=============================================================
+Celery Workers — Scheduled Ingestion & Scan Jobs (Binance REST)
+===============================================================
 
 Job structure:
   ┌──────────────────────────────────────────────────────────────────┐
   │  Beat scheduler (cron)                                          │
-  │  ├── ingest_tickers      every 90s   CoinGecko /coins/markets   │
+    │  ├── ingest_tickers      every 90s   Binance /api/v3/ticker/24hr│
   │  ├── run_scan_cycle      every 90s   compute metrics + rules    │
   │  └── cleanup_stale       every 300s  mark stale feeds           │
   │                                                                  │
   │  Each task is idempotent — safe to retry on failure.             │
   └──────────────────────────────────────────────────────────────────┘
 
-Data source: CoinGecko Demo API (key sent via x-cg-demo-api-key header).
+Data source: Binance REST API.
 """
 
 from __future__ import annotations
 
+import csv
 import logging
-import time
+import os
 from datetime import datetime, timezone
+from pathlib import Path
 
 from celery import Celery
 
+from binance_client import fetch_ticker_24h_sync
 from config import settings
 from logging_config import setup_logging
 
 setup_logging()
 logger = logging.getLogger(__name__)
-
-# ─── Symbol Mapping ──────────────────────────────────────────────────────────
-# Maps our DB symbol format (BTC/USDT) → CoinGecko coin ID
-
-SYMBOL_TO_COINGECKO: dict[str, str] = {
-    "BTC/USDT": "bitcoin",
-    "ETH/USDT": "ethereum",
-    "SOL/USDT": "solana",
-    "BNB/USDT": "binancecoin",
-    "XRP/USDT": "ripple",
-    "ADA/USDT": "cardano",
-    "DOGE/USDT": "dogecoin",
-    "AVAX/USDT": "avalanche-2",
-    "DOT/USDT": "polkadot",
-    "MATIC/USDT": "matic-network",
-    "LINK/USDT": "chainlink",
-    "UNI/USDT": "uniswap",
-    "ATOM/USDT": "cosmos",
-    "LTC/USDT": "litecoin",
-    "FIL/USDT": "filecoin",
-}
-
-COINGECKO_TO_SYMBOL: dict[str, str] = {v: k for k, v in SYMBOL_TO_COINGECKO.items()}
-
 
 # ─── Celery App ───────────────────────────────────────────────────────────────
 
@@ -90,78 +69,17 @@ celery_app.conf.update(
 )
 
 
-# ─── Rate Limiter (simple for CoinGecko free tier) ───────────────────────────
-
-_last_request_time = 0.0
-MIN_REQUEST_GAP = 2.5  # seconds between CoinGecko requests (free tier safe)
-
-
-def _coingecko_get(path: str, params: dict | None = None) -> dict | list:
-    """
-    GET request to CoinGecko Demo API with rate limiting and retry.
-    Sends API key via x-cg-demo-api-key header when configured.
-    """
-    import httpx
-    global _last_request_time
-
-    elapsed = time.monotonic() - _last_request_time
-    if elapsed < MIN_REQUEST_GAP:
-        time.sleep(MIN_REQUEST_GAP - elapsed)
-
-    url = f"{settings.coingecko_rest_base}{path}"
-    headers = {}
-    if settings.coingecko_api_key:
-        headers["x-cg-demo-api-key"] = settings.coingecko_api_key
-
-    for attempt in range(3):
-        try:
-            _last_request_time = time.monotonic()
-            resp = httpx.get(url, params=params, headers=headers, timeout=15.0)
-
-            if resp.status_code == 429:
-                wait = int(resp.headers.get("Retry-After", 30))
-                logger.warning("CoinGecko 429 — backing off %ds", wait)
-                time.sleep(wait)
-                continue
-
-            if resp.status_code >= 500:
-                wait = 2 ** (attempt + 1)
-                logger.warning("CoinGecko %d — retry in %ds", resp.status_code, wait)
-                time.sleep(wait)
-                continue
-
-            resp.raise_for_status()
-            return resp.json()
-
-        except httpx.TimeoutException:
-            if attempt < 2:
-                time.sleep(2 ** (attempt + 1))
-                continue
-            raise
-
-    raise RuntimeError(f"CoinGecko API failed after 3 attempts: {path}")
-
-
-# ─── Task: Ingest Tickers (CoinGecko) ────────────────────────────────────────
+# ─── Task: Ingest Tickers (Binance REST) ─────────────────────────────────────
 
 @celery_app.task(name="workers.ingest_tickers", bind=True, max_retries=3)
 def ingest_tickers(self):
     """
-    Fetch market data from CoinGecko /coins/markets endpoint.
-    Single call returns price, 24h change, volume, high/low for all coins.
+    Fetch market data from Binance /api/v3/ticker/24hr.
+    Single call returns price, 24h change, volume, bid/ask, and high/low.
     """
     try:
-        coin_ids = ",".join(SYMBOL_TO_COINGECKO.values())
-        data = _coingecko_get("/coins/markets", params={
-            "vs_currency": "usd",
-            "ids": coin_ids,
-            "order": "market_cap_desc",
-            "per_page": 50,
-            "page": 1,
-            "sparkline": "false",
-            "price_change_percentage": "24h",
-        })
-        logger.info("Fetched %d coins from CoinGecko", len(data))
+        data = fetch_ticker_24h_sync()
+        logger.info("Fetched %d symbols from Binance REST", len(data))
 
         from sqlalchemy import create_engine, text as sa_text
         engine = create_engine(settings.database_url_sync)
@@ -174,17 +92,19 @@ def ingest_tickers(self):
             symbol_map = {row[1]: row[0] for row in tracked}
 
             inserted = 0
-            for coin in data:
-                cg_id = coin.get("id", "")
-                our_symbol = COINGECKO_TO_SYMBOL.get(cg_id)
-                if not our_symbol or our_symbol not in symbol_map:
+            for ticker in data:
+                our_symbol = ticker["symbol"]
+                if our_symbol not in symbol_map:
                     continue
 
-                price = coin.get("current_price") or 0
-                change_pct = coin.get("price_change_percentage_24h") or 0
-                high = coin.get("high_24h") or 0
-                low = coin.get("low_24h") or 0
-                volume = coin.get("total_volume") or 0
+                price = ticker["current_price"]
+                change_pct = ticker["price_change_pct_24h"]
+                high = ticker["high_24h"]
+                low = ticker["low_24h"]
+                volume = ticker["volume_24h"]
+                bid_price = ticker["bid_price"]
+                ask_price = ticker["ask_price"]
+                spread_bps = ticker["bid_ask_spread_bps"]
 
                 conn.execute(sa_text("""
                     INSERT INTO snapshot_metrics (
@@ -193,10 +113,10 @@ def ingest_tickers(self):
                         high_24h, low_24h, volume_24h,
                         bid_price, ask_price, bid_ask_spread_bps
                     ) VALUES (
-                        :ts, :sid, 'coingecko', 'crypto',
+                        :ts, :sid, 'binance', 'crypto',
                         :price, :change_pct,
                         :high, :low, :vol,
-                        :price, :price, 0
+                        :bid_price, :ask_price, :spread_bps
                     )
                     ON CONFLICT (ts, symbol_id) DO UPDATE SET
                         current_price = EXCLUDED.current_price,
@@ -212,10 +132,13 @@ def ingest_tickers(self):
                     "high": high,
                     "low": low,
                     "vol": volume,
+                    "bid_price": bid_price,
+                    "ask_price": ask_price,
+                    "spread_bps": spread_bps,
                 })
                 inserted += 1
 
-        logger.info("Ingested %d ticker snapshots from CoinGecko", inserted)
+        logger.info("Ingested %d ticker snapshots from Binance REST", inserted)
         return {"status": "ok", "count": inserted}
 
     except Exception as exc:
@@ -289,6 +212,7 @@ def run_scan_cycle(self):
                     atr_14=float(r.atr_14 or 0),
                     bid_ask_spread_bps=float(r.bid_ask_spread_bps or 0),
                 ))
+            snapshot_by_symbol_id = {snapshot.symbol_id: snapshot for snapshot in snapshots}
 
             # Step 3: Run detection rules
             hour = now.hour
@@ -303,15 +227,36 @@ def run_scan_cycle(self):
             results = run_scan(snapshots, session=session, now=now)
 
             # Step 4: Persist alerts & dispatch notifications
+            #
+            # The DB alert_rule enum only supports: volume_spike,
+            # volatility_breakout, spread_widening, price_change_pct, custom.
+            # Map scanner rule keys that don't exist in the enum.
+            _RULE_TO_DB = {
+                "volume_spike": "volume_spike",
+                "volatility_breakout": "volatility_breakout",
+                "combined": "volume_spike",          # highest-conviction combo → store as volume_spike
+                "session_activity": "custom",         # informational → custom
+                "composite_rank": "custom",           # ranking → custom
+            }
+
             total_alerts = 0
+            all_dispatched: list[dict] = []
+
             for rule_name, alerts in results.items():
+                db_rule = _RULE_TO_DB.get(rule_name, "custom")
+
                 for alert in alerts:
+                    # Tag the message so the original rule is recoverable
+                    msg = alert.message
+                    if db_rule != rule_name:
+                        msg = f"[{rule_name}] {msg}"
+
                     users = conn.execute(sa_text("""
                         SELECT DISTINCT user_id FROM user_thresholds
                         WHERE rule = CAST(:rule AS alert_rule)
                           AND is_enabled = TRUE
                           AND (symbol_id IS NULL OR symbol_id = :sid)
-                    """), {"rule": rule_name, "sid": alert.symbol_id}).fetchall()
+                    """), {"rule": db_rule, "sid": alert.symbol_id}).fetchall()
 
                     for (user_id,) in users:
                         conn.execute(sa_text("""
@@ -322,20 +267,33 @@ def run_scan_cycle(self):
                         """), {
                             "uid": user_id,
                             "sid": alert.symbol_id,
-                            "rule": rule_name,
+                            "rule": db_rule,
                             "price": alert.trigger_price,
                             "vol_ratio": alert.trigger_volume_ratio,
                             "volatility": alert.trigger_volatility,
                             "spread": alert.trigger_spread_bps,
-                            "msg": alert.message,
+                            "msg": msg,
                         })
                         total_alerts += 1
 
-                    if alerts:
-                        dispatch_alerts.delay([
-                            {"symbol": a.symbol, "rule": a.rule.value, "message": a.message}
-                            for a in alerts
-                        ])
+                    snapshot = snapshot_by_symbol_id.get(alert.symbol_id)
+                    all_dispatched.append({
+                        "symbol": alert.symbol,
+                        "rule": alert.rule.value,
+                        "message": msg,
+                        "trigger_price": alert.trigger_price,
+                        "trigger_volume_ratio": alert.trigger_volume_ratio,
+                        "trigger_volatility": alert.trigger_volatility,
+                        "price_change_pct_24h": snapshot.price_change_pct_24h if snapshot else 0.0,
+                        "atr_14": snapshot.atr_14 if snapshot else 0.0,
+                    })
+
+            # Dispatch all alerts in one batch
+            if all_dispatched:
+                dispatch_alerts.delay(all_dispatched)
+
+            # Step 5: CSV export
+            _export_alerts_csv(results, now)
 
             logger.info("Scan cycle: %d snapshots, %d alerts", len(snapshots), total_alerts)
             return {"snapshots": len(snapshots), "alerts": total_alerts}
@@ -343,6 +301,47 @@ def run_scan_cycle(self):
     except Exception as exc:
         logger.exception("run_scan_cycle failed")
         raise self.retry(exc=exc, countdown=10)
+
+
+# ─── CSV Alert Export ─────────────────────────────────────────────────────────
+
+def _export_alerts_csv(
+    results: dict[str, list],
+    now: datetime,
+) -> None:
+    """Write all alerts from the latest scan cycle to a timestamped CSV."""
+    export_dir = Path(settings.alerts_export_dir)
+    try:
+        export_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        logger.warning("Cannot create alerts export dir %s: %s", export_dir, e)
+        return
+
+    filename = now.strftime("scanner_alerts_%Y%m%d_%H%M.csv")
+    filepath = export_dir / filename
+
+    rows_written = 0
+    try:
+        with open(filepath, "w", newline="") as fh:
+            writer = csv.writer(fh)
+            writer.writerow(["Timestamp", "Symbol", "Rule", "Message", "Price", "Change%", "VolRatio"])
+
+            for rule_name, alerts in results.items():
+                for a in alerts:
+                    writer.writerow([
+                        a.ts.strftime("%Y-%m-%d %H:%M:%S"),
+                        a.symbol,
+                        rule_name,
+                        a.message,
+                        f"{a.trigger_price:.4f}" if a.trigger_price else "",
+                        "",  # Change% not stored on Alert directly
+                        f"{a.trigger_volume_ratio:.2f}" if a.trigger_volume_ratio else "",
+                    ])
+                    rows_written += 1
+
+        logger.info("CSV export: %d alerts → %s", rows_written, filepath)
+    except OSError as e:
+        logger.warning("CSV export failed: %s", e)
 
 
 # ─── Task: Dispatch Alerts ───────────────────────────────────────────────────
@@ -354,12 +353,7 @@ def dispatch_alerts(self, alert_payloads: list[dict]):
         from alert_dispatcher import AlertDispatcher
         dispatcher = AlertDispatcher()
 
-        for payload in alert_payloads:
-            dispatcher.send_all(
-                symbol=payload["symbol"],
-                rule=payload["rule"],
-                message=payload["message"],
-            )
+        dispatcher.send_batch(alert_payloads)
 
         return {"dispatched": len(alert_payloads)}
 

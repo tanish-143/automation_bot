@@ -29,36 +29,78 @@ SYSTEM_PROMPT = """You are a crypto scanner analyst. I will paste CSV alert data
 3. Sort by signal strength: combined > volume_spike > volatility_anomaly
 4. Within each category, sort by |Change%| × VolRatio (highest first)
 
-**Output format (always follow this exactly):**
+**Output format — return ONLY valid JSON, no markdown fences, no extra text:**
 
-## 🔴 TOP SHORT CANDIDATES (combined signals, price falling + high volume)
-| # | Symbol | Price | Change% | VolRatio | Signal | Note |
-(Max 8 rows, only combined signals with Change% < -3% and VolRatio > 2x)
+{
+  "long_setups": [
+    {
+      "symbol": "BTC/USDT",
+      "limit_entry": 67000.00,
+      "stop_loss": 65500.00,
+      "take_profit": 70000.00,
+      "signal": "combined",
+      "volume_ratio": 4.2,
+      "change_pct": 5.1,
+      "confidence": "high",
+      "note": "Strong volume + breakout above resistance"
+    }
+  ],
+  "short_setups": [
+    {
+      "symbol": "ETH/USDT",
+      "limit_entry": 3400.00,
+      "stop_loss": 3550.00,
+      "take_profit": 3100.00,
+      "signal": "combined",
+      "volume_ratio": 3.8,
+      "change_pct": -6.2,
+      "confidence": "high",
+      "note": "Heavy selling volume + broke support"
+    }
+  ],
+  "volume_only": [
+    {
+      "symbol": "SOL/USDT",
+      "price": 150.00,
+      "volume_ratio": 6.5,
+      "change_pct": 1.2,
+      "note": "Watch for breakout direction"
+    }
+  ],
+  "extreme_movers": ["DOGE/USDT"],
+  "summary": {
+    "market_bias": "BEARISH",
+    "best_long": "BTC — volume breakout above 67k with 4x vol",
+    "best_short": "ETH — broke 3400 support on 3.8x volume",
+    "key_risk": "High correlation across majors — one reversal moves everything"
+  }
+}
 
-## 🟢 TOP LONG CANDIDATES (combined signals OR volatility up + volume)
-| # | Symbol | Price | Change% | VolRatio | Signal | Note |
-(Max 5 rows, only Change% > 3%)
+**Rules for setups:**
+- long_setups: Max 5, only combined signals with Change% > 3% and VolRatio > 2x.
+  limit_entry slightly below current price (buy the dip). SL below recent support. TP at 2:1+ R:R.
+- short_setups: Max 8, only combined signals with Change% < -3% and VolRatio > 2x.
+  limit_entry slightly above current price (sell the rally). SL above recent resistance. TP at 2:1+ R:R.
+- volume_only: Max 5, VolRatio > 5x but |Change%| < 3%.
+- extreme_movers: Symbols with |Change%| > 15%.
+- Use the volume_ratio from the data — do NOT use 0 or default values.
+- If Chandelier Exit data is provided, incorporate it: prefer longs where ce_dir=1, shorts where ce_dir=-1.
 
-## 📊 VOLUME-ONLY SPIKES (high volume but small price move — watch for breakout)
-| # | Symbol | Price | Change% | VolRatio |
-(Max 5 rows, VolRatio > 5x but |Change%| < 3%)
-
-## ⚠️ EXTREME MOVERS (>15% move — avoid or scalp only)
-List symbols with |Change%| > 15%
-
-## 🎯 SUMMARY
-- Market bias: [BEARISH/BULLISH/NEUTRAL]
-- Best short: [symbol + reason in 10 words]
-- Best long: [symbol + reason in 10 words]
-- Key risk: [one sentence]
-
-**Ignore:** USDTUSDT, USDCUSDT, USD1USDT (stablecoins)"""
+**Ignore stablecoins: USDTUSDT, USDCUSDT, USD1USDT**"""
 
 
-def format_prices_as_csv(prices: list[dict]) -> str:
-    """Convert live price data into CSV format for the AI prompt."""
+def format_prices_as_csv(prices: list[dict], ce_data: dict | None = None) -> str:
+    """Convert live price data into CSV format for the AI prompt.
+
+    Args:
+        prices: List of price dicts (must include volume_ratio from DB feed).
+        ce_data: Optional dict of {symbol: {ce_dir, longStop, shortStop, ...}}.
+    """
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
-    lines = ["timestamp,symbol,price,change_pct_24h,volume_24h,volume_ratio,signal"]
+    header = "timestamp,symbol,price,change_pct_24h,volume_24h,volume_ratio,signal"
+    if ce_data:
+        header += ",ce_dir,longStop,shortStop"
+    lines = [header]
 
     for p in prices:
         symbol = p.get("symbol", "").replace("/", "")
@@ -78,27 +120,36 @@ def format_prices_as_csv(prices: list[dict]) -> str:
         else:
             signal = "normal"
 
-        lines.append(
-            f"{now},{symbol},{price:.4f},{change:.2f},{volume:.0f},{vol_ratio:.2f},{signal}"
-        )
+        line = f"{now},{symbol},{price:.4f},{change:.2f},{volume:.0f},{vol_ratio:.2f},{signal}"
+
+        if ce_data:
+            sym_key = p.get("symbol", "")
+            ce = ce_data.get(sym_key)
+            if ce:
+                line += f",{ce.get('ce_dir', 0)},{ce.get('longStop', 0):.4f},{ce.get('shortStop', 0):.4f}"
+            else:
+                line += ",0,0,0"
+
+        lines.append(line)
 
     return "\n".join(lines)
 
 
-async def analyze_trade_setup(prices: list[dict]) -> str:
+async def analyze_trade_setup(prices: list[dict], ce_data: dict | None = None) -> str:
     """
-    Send scanner data to Groq AI and return markdown trade analysis.
+    Send scanner data to Groq AI and return structured trade analysis.
 
     Args:
-        prices: List of live price dicts from CoinGecko.
+        prices: List of live price dicts (must include volume_ratio from DB).
+        ce_data: Optional Chandelier Exit dict {symbol: {ce_dir, longStop, ...}}.
 
     Returns:
-        Markdown string with trade setup recommendations.
+        JSON string with long_setups, short_setups (limit entry, SL, TP).
     """
     if not settings.groq_api_key:
         return "⚠️ Groq API key not configured. Set `SCANNER_GROQ_API_KEY` in .env"
 
-    csv_data = format_prices_as_csv(prices)
+    csv_data = format_prices_as_csv(prices, ce_data=ce_data)
 
     try:
         from groq import AsyncGroq

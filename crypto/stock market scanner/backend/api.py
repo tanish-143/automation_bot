@@ -13,6 +13,7 @@ Endpoints:
 from __future__ import annotations
 
 import logging
+import os
 from datetime import datetime, timezone
 from enum import Enum
 
@@ -22,6 +23,7 @@ from pydantic import BaseModel, field_validator
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from binance_client import fetch_candles_for_app_symbols_async, fetch_ticker_24h_async
 from config import settings
 from db import get_db
 from logging_config import setup_logging
@@ -308,144 +310,101 @@ async def get_snapshot_history(
     return [dict(r._mapping) for r in result.all()]
 
 
-# ─── Live CoinGecko prices (bypass DB for instant refresh) ────────────────────
-
-# Tickers to skip: stablecoins, wrapped/pegged assets, LSDs, tokenized securities
-_SKIP_TICKERS = frozenset({
-    # Stablecoins
-    "USDT", "USDC", "USDD", "DAI", "BUSD", "TUSD", "FDUSD", "PYUSD",
-    "USD1", "USDP", "USDE", "SUSDE", "USDS", "USDX", "GUSD", "FRAX",
-    "LUSD", "CRVUSD", "GHO", "USDB", "EURC", "EURS", "USDG", "USDF",
-    "RLUSD", "USDY", "USD0", "USDTB", "USDA", "AUSD", "UDS", "NUSD",
-    "USTBL", "REUSD", "IUSD", "USX", "USDAI", "BFUSD", "BBUSD",
-    # Wrapped / pegged / LSDs
-    "WBTC", "WETH", "STETH", "WSTETH", "CBBTC", "CBETH",
-    "RETH", "WEETH", "METH", "EZETH", "RSETH", "OSETH",
-    "TBTC", "SOLVBTC", "EBTC", "LBTC",
-    # Tokenized real-world / money market
-    "BUIDL", "USYC", "USTB", "YLDS", "OUSG", "JAAA", "JTRSY", "EUTBL",
-    "PAXG", "XAUT", "KAU",
-    # Misc non-trading tokens
-    "FIGR_HELOC", "WLFI", "STABLE",
-})
-
-
-def _coin_symbol(coin: dict) -> str:
-    """Build a trading pair symbol from a CoinGecko coin object."""
-    ticker = (coin.get("symbol") or "").upper()
-    return f"{ticker}/USDT"
-
-
 @app.get("/scan/live-prices")
 async def get_live_prices():
     """
-    Fetch real-time prices for top 100+ coins directly from CoinGecko API.
+    Fetch live prices for tracked symbols directly from Binance REST.
     Used by the frontend refresh button for instant data.
     """
-    import httpx
+    tickers = await fetch_ticker_24h_async()
+    candles = await fetch_candles_for_app_symbols_async(
+        [ticker["symbol"] for ticker in tickers],
+        interval="1h",
+        limit=24,
+    )
 
-    headers = {}
-    if settings.coingecko_api_key:
-        headers["x-cg-demo-api-key"] = settings.coingecko_api_key
-
-    results = []
-    # Fetch 2 pages of 100 to get 200 coins (covers top 100+ after stablecoin filter)
-    async with httpx.AsyncClient() as client:
-        for page in (1, 2):
-            resp = await client.get(
-                f"{settings.coingecko_rest_base}/coins/markets",
-                params={
-                    "vs_currency": "usd",
-                    "order": "market_cap_desc",
-                    "per_page": 100,
-                    "page": page,
-                    "sparkline": "true",
-                    "price_change_percentage": "24h",
-                },
-                headers=headers,
-                timeout=20.0,
-            )
-            resp.raise_for_status()
-            data = resp.json()
-
-            for coin in data:
-                ticker = (coin.get("symbol") or "").upper()
-                # Skip stablecoins, wrapped assets, and pegged tokens
-                if ticker in _SKIP_TICKERS:
-                    continue
-
-                sparkline_data = coin.get("sparkline_in_7d", {}).get("price", [])
-                sparkline_24h = sparkline_data[-24:] if len(sparkline_data) >= 24 else sparkline_data
-
-                results.append({
-                    "symbol": f"{ticker}/USDT",
-                    "current_price": coin.get("current_price") or 0,
-                    "price_change_pct_24h": coin.get("price_change_percentage_24h") or 0,
-                    "volume_24h": coin.get("total_volume") or 0,
-                    "high_24h": coin.get("high_24h") or 0,
-                    "low_24h": coin.get("low_24h") or 0,
-                    "market_cap": coin.get("market_cap") or 0,
-                    "market_cap_rank": coin.get("market_cap_rank"),
-                    "sparkline": sparkline_24h,
-                    "image": coin.get("image", ""),
-                    "last_updated": coin.get("last_updated", ""),
-                })
-
-    return results
+    return [
+        {
+            **ticker,
+            "sparkline": candles.get(ticker["symbol"], {}).get("closes", []),
+        }
+        for ticker in tickers
+    ]
 
 
 # ─── AI Trade Setup Analysis (Groq) ──────────────────────────────────────────
 
 @app.get("/scan/ai-analysis")
-async def get_ai_analysis():
+async def get_ai_analysis(db: AsyncSession = Depends(get_db)):
     """
-    Fetch live prices for top 100 coins from CoinGecko, send to Groq AI,
-    and return markdown trade setup analysis.
+    Fetch live prices for tracked Binance pairs, enrich with
+    volume_ratio from DB, optionally compute Chandelier Exit, then
+    send to Groq AI for structured trade setup analysis.
+
+    Returns JSON with long_setups, short_setups (each with limit entry, SL, TP).
     """
-    import httpx
     from groq_ai import analyze_trade_setup
 
     if not settings.groq_api_key:
         raise HTTPException(503, "Groq API key not configured")
 
-    headers = {}
-    if settings.coingecko_api_key:
-        headers["x-cg-demo-api-key"] = settings.coingecko_api_key
-
     try:
-        async with httpx.AsyncClient() as client:
-            resp = await client.get(
-                f"{settings.coingecko_rest_base}/coins/markets",
-                params={
-                    "vs_currency": "usd",
-                    "order": "market_cap_desc",
-                    "per_page": 100,
-                    "page": 1,
-                    "sparkline": "false",
-                    "price_change_percentage": "24h",
-                },
-                headers=headers,
-                timeout=20.0,
-            )
-            resp.raise_for_status()
-            data = resp.json()
+        tickers = await fetch_ticker_24h_async()
     except Exception as e:
-        raise HTTPException(502, f"CoinGecko fetch failed: {e}")
+        raise HTTPException(502, f"Binance fetch failed: {e}")
+
+    # Load volume_ratio from DB for known symbols
+    db_vol_ratios: dict[str, float] = {}
+    try:
+        result = await db.execute(text(
+            "SELECT symbol, volume_ratio FROM v_scanner_feed"
+        ))
+        for row in result.mappings().all():
+            db_vol_ratios[row["symbol"]] = float(row["volume_ratio"] or 0)
+    except Exception:
+        logger.warning("Could not load volume_ratios from DB, using Binance only")
 
     prices = []
-    for coin in data:
-        ticker = (coin.get("symbol") or "").upper()
-        if ticker in _SKIP_TICKERS:
-            continue
+    ce_candle_data = await fetch_candles_for_app_symbols_async(
+        [ticker["symbol"] for ticker in tickers],
+        interval="15m",
+        limit=max(settings.ce_atr_period + 8, 32),
+    )
+
+    for ticker in tickers:
+        symbol = ticker["symbol"]
         prices.append({
-            "symbol": f"{ticker}/USDT",
-            "current_price": coin.get("current_price") or 0,
-            "price_change_pct_24h": coin.get("price_change_percentage_24h") or 0,
-            "volume_24h": coin.get("total_volume") or 0,
-            "volume_ratio": 0,
+            "symbol": symbol,
+            "current_price": ticker["current_price"],
+            "price_change_pct_24h": ticker["price_change_pct_24h"],
+            "volume_24h": ticker["volume_24h"],
+            "volume_ratio": db_vol_ratios.get(symbol, 0),
         })
 
-    # Step 3: Send to Groq AI
-    analysis = await analyze_trade_setup(prices)
+    # Compute Chandelier Exit from sparkline data
+    ce_data: dict[str, dict] = {}
+    if ce_candle_data:
+        try:
+            import sys
+            sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "crypto"))
+            from chandelier_exit import compute_ce_for_symbols
+            ce_results = compute_ce_for_symbols(
+                ce_candle_data,
+                atr_length=settings.ce_atr_period,
+                multiplier=settings.ce_atr_mult,
+            )
+            for sym, ce in ce_results.items():
+                ce_data[sym] = {
+                    "ce_dir": ce.ce_dir,
+                    "ce_buySignal": ce.ce_buySignal,
+                    "ce_sellSignal": ce.ce_sellSignal,
+                    "longStop": ce.longStop,
+                    "shortStop": ce.shortStop,
+                }
+        except Exception:
+            logger.warning("Chandelier Exit computation failed, proceeding without CE")
+
+    # Send to Groq AI
+    analysis = await analyze_trade_setup(prices, ce_data if ce_data else None)
 
     return {"analysis": analysis, "coin_count": len(prices)}

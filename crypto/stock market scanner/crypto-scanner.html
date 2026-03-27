@@ -1,0 +1,839 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<title>⚡ Crypto Market Scanner — Live</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<script>
+tailwind.config = {
+  darkMode: 'class',
+  theme: { extend: {} }
+}
+</script>
+<style>
+html { color-scheme: dark; }
+body {
+  margin: 0; background: #09090b; color: #e4e4e7;
+  font-family: ui-monospace, 'Cascadia Code', 'JetBrains Mono', Consolas, monospace;
+  -webkit-font-smoothing: antialiased;
+}
+#root { min-height: 100svh; }
+::-webkit-scrollbar { width: 6px; height: 6px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: #3f3f46; border-radius: 3px; }
+::-webkit-scrollbar-thumb:hover { background: #52525b; }
+@keyframes popup-in { from { opacity: 0; transform: scale(0.92) translateY(4px); } to { opacity: 1; transform: scale(1) translateY(0); } }
+.animate-in { animation: popup-in 0.15s ease-out forwards; }
+@keyframes glow-pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.7; } }
+@keyframes volatile-dot-pulse { 0%,100% { transform: scale(1); opacity: 1; } 50% { transform: scale(1.4); opacity: 0.6; } }
+.volatile-tile { animation: glow-pulse 2s ease-in-out infinite; }
+.volatile-dot { animation: volatile-dot-pulse 1.5s ease-in-out infinite; }
+@keyframes spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
+.anim-spin { animation: spin 1s linear infinite; }
+@keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: .5; } }
+.anim-pulse { animation: pulse 2s cubic-bezier(0.4,0,0.6,1) infinite; }
+</style>
+</head>
+<body class="dark">
+<div id="root"></div>
+
+<script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+<script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+
+<script type="text/babel" data-type="module">
+const { useState, useEffect, useMemo, useCallback, useRef, memo, createContext, useContext } = React;
+
+/* ── Binance Public API ─────────────────────────────────── */
+const BINANCE_API = 'https://api.binance.com';
+
+async function fetchTicker24h() {
+  const res = await fetch(`${BINANCE_API}/api/v3/ticker/24hr`);
+  if (!res.ok) throw new Error('Binance API error');
+  const data = await res.json();
+  // Filter USDT pairs, sort by quote volume, take top 100
+  return data
+    .filter(t => t.symbol.endsWith('USDT') && parseFloat(t.quoteVolume) > 100000)
+    .sort((a, b) => parseFloat(b.quoteVolume) - parseFloat(a.quoteVolume))
+    .slice(0, 100)
+    .map((t, i) => ({
+      symbol_id: i + 1,
+      symbol: t.symbol.replace('USDT', '/USDT'),
+      exchange: 'binance',
+      asset_class: 'crypto',
+      current_price: parseFloat(t.lastPrice),
+      price_change_pct_24h: parseFloat(t.priceChangePercent),
+      volume_24h: parseFloat(t.quoteVolume),
+      volume_ratio: null,
+      realized_volatility: null,
+      volatility_percentile: null,
+      composite_score: null,
+      high_24h: parseFloat(t.highPrice),
+      low_24h: parseFloat(t.lowPrice),
+      sparkline: [],
+      raw_symbol: t.symbol,
+    }));
+}
+
+async function fetchKlines(rawSymbol, interval = '1h', limit = 24) {
+  const res = await fetch(
+    `${BINANCE_API}/api/v3/klines?symbol=${rawSymbol}&interval=${interval}&limit=${limit}`
+  );
+  if (!res.ok) return [];
+  const data = await res.json();
+  return data.map(k => parseFloat(k[4])); // close prices
+}
+
+/* ── Simple State Store (like Zustand) ──────────────────── */
+let storeState = {
+  symbols: [],
+  filters: {
+    session: 'all', timeframe: '1h', volumeRatioMin: 1,
+    volatilityPctMin: 0, minVolume: 10000, exchange: 'all', assetClass: 'all',
+  },
+  selectedSymbol: null,
+  detailOpen: false,
+};
+const listeners = new Set();
+function useStore(selector) {
+  const [val, setVal] = useState(() => selector(storeState));
+  useEffect(() => {
+    const cb = () => {
+      const next = selector(storeState);
+      setVal(prev => {
+        if (prev === next) return prev;
+        if (Array.isArray(prev) && Array.isArray(next) && prev.length === next.length && prev.every((v,i) => v === next[i])) return prev;
+        return next;
+      });
+    };
+    listeners.add(cb);
+    return () => listeners.delete(cb);
+  }, []);
+  return val;
+}
+function setStore(updater) {
+  if (typeof updater === 'function') storeState = { ...storeState, ...updater(storeState) };
+  else storeState = { ...storeState, ...updater };
+  listeners.forEach(cb => cb());
+}
+
+/* ── Utility Functions ──────────────────────────────────── */
+function fmt(n, decimals = 2) {
+  if (n == null) return '—';
+  if (Math.abs(n) >= 1e9) return `${(n / 1e9).toFixed(1)}B`;
+  if (Math.abs(n) >= 1e6) return `${(n / 1e6).toFixed(1)}M`;
+  if (Math.abs(n) >= 1e3) return `${(n / 1e3).toFixed(1)}K`;
+  return n.toFixed(decimals);
+}
+function fmtPrice(n) {
+  if (n == null) return '—';
+  if (n >= 1) return n.toLocaleString(undefined, { maximumFractionDigits: 2 });
+  if (n >= 0.01) return n.toFixed(4);
+  return n.toPrecision(4);
+}
+function pctClass(v) {
+  if (v == null) return 'text-zinc-500';
+  return v >= 0 ? 'text-emerald-400' : 'text-red-400';
+}
+
+/* ── SVG Sparkline Component ────────────────────────────── */
+const Sparkline = memo(function Sparkline({ data, width = 80, height = 28, positive }) {
+  if (!data || data.length < 2) return <span className="text-zinc-600">—</span>;
+  const min = Math.min(...data);
+  const max = Math.max(...data);
+  const range = max - min || 1;
+  const points = data.map((v, i) => {
+    const x = (i / (data.length - 1)) * width;
+    const y = height - ((v - min) / range) * (height - 4) - 2;
+    return `${x},${y}`;
+  }).join(' ');
+  const color = positive === undefined ? '#6366f1' : positive ? '#22c55e' : '#ef4444';
+  return (
+    <svg width={width} height={height} viewBox={`0 0 ${width} ${height}`}>
+      <polyline fill="none" stroke={color} strokeWidth="1.5" points={points} />
+    </svg>
+  );
+});
+
+/* ── FilterPanel Component ──────────────────────────────── */
+function FilterPanel() {
+  const filters = useStore(s => s.filters);
+  const symbols = useStore(s => s.symbols);
+
+  const setFilters = (patch) => setStore(s => ({ filters: { ...s.filters, ...patch } }));
+
+  const filtered = useMemo(() => {
+    return symbols.filter(row => {
+      if (row.volume_24h != null && row.volume_24h < filters.minVolume) return false;
+      if (row.volume_ratio != null && row.volume_ratio > 0 && row.volume_ratio < filters.volumeRatioMin) return false;
+      if (filters.exchange !== 'all' && row.exchange !== filters.exchange) return false;
+      if (filters.assetClass !== 'all' && row.asset_class !== filters.assetClass) return false;
+      return true;
+    });
+  }, [symbols, filters]);
+
+  const spikeCounts = useMemo(() => {
+    let volatileCoins = 0;
+    for (const s of symbols) {
+      if (s.price_change_pct_24h != null && Math.abs(s.price_change_pct_24h) >= 5) volatileCoins++;
+    }
+    return { volatileCoins };
+  }, [symbols]);
+
+  const defaults = { session: 'all', timeframe: '1h', volumeRatioMin: 1, volatilityPctMin: 0, minVolume: 10000, exchange: 'all', assetClass: 'all' };
+  const activeCount = Object.keys(defaults).reduce((n, k) => n + (filters[k] !== defaults[k] ? 1 : 0), 0);
+
+  return (
+    <aside className="w-64 shrink-0 border-r border-zinc-800 p-4 space-y-5 overflow-y-auto bg-zinc-950 max-lg:hidden">
+      <div className="flex items-center justify-between">
+        <h2 className="text-sm font-semibold text-zinc-400 uppercase tracking-wider">Filters</h2>
+        {activeCount > 0 && (
+          <button onClick={() => setFilters(defaults)}
+            className="text-[10px] px-2 py-0.5 rounded bg-zinc-800 text-zinc-400 hover:bg-zinc-700 hover:text-zinc-200 transition-colors">
+            Reset ({activeCount})
+          </button>
+        )}
+      </div>
+
+      <div className="text-[11px] text-zinc-500">
+        Showing <span className="text-indigo-400 font-semibold">{filtered.length}</span> of {symbols.length} coins
+      </div>
+
+      {spikeCounts.volatileCoins > 0 && (
+        <div className="flex items-center gap-2 px-2.5 py-1.5 rounded-md bg-rose-500/10 border border-rose-500/20">
+          <span className="text-sm">🌊</span>
+          <span className="text-[11px] text-rose-400 font-medium">
+            {spikeCounts.volatileCoins} volatile (≥5% 24h)
+          </span>
+        </div>
+      )}
+
+      <fieldset>
+        <legend className="text-xs text-zinc-500 mb-1.5">Session</legend>
+        <div className="flex flex-wrap gap-1.5">
+          {[{v:'all',l:'All'},{v:'asia',l:'🌏 Asia'},{v:'europe',l:'🌍 EU'},{v:'us',l:'🌎 US'}].map(s => (
+            <button key={s.v} onClick={() => setFilters({ session: s.v })}
+              className={`px-2.5 py-1 rounded text-xs font-medium transition ${
+                filters.session === s.v ? 'bg-indigo-600 text-white' : 'bg-zinc-800 text-zinc-400 hover:bg-zinc-700'}`}>
+              {s.l}
+            </button>
+          ))}
+        </div>
+      </fieldset>
+
+      <fieldset>
+        <legend className="text-xs text-zinc-500 mb-1.5">Timeframe</legend>
+        <div className="flex flex-wrap gap-1.5">
+          {['1m','5m','15m','1h','4h','1d'].map(tf => (
+            <button key={tf} onClick={() => setFilters({ timeframe: tf })}
+              className={`px-2.5 py-1 rounded text-xs font-medium transition ${
+                filters.timeframe === tf ? 'bg-indigo-600 text-white' : 'bg-zinc-800 text-zinc-400 hover:bg-zinc-700'}`}>
+              {tf}
+            </button>
+          ))}
+        </div>
+      </fieldset>
+
+      <fieldset>
+        <legend className="text-xs text-zinc-500 mb-1.5">
+          Min 24h Volume ($) <span className="text-indigo-400 font-semibold">{fmt(filters.minVolume)}</span>
+        </legend>
+        <input type="range" min={0} max={5000000} step={50000}
+          value={filters.minVolume} onChange={e => setFilters({ minVolume: +e.target.value })}
+          className="w-full accent-indigo-500" />
+        <div className="flex justify-between text-[10px] text-zinc-600"><span>$0</span><span>$5M</span></div>
+      </fieldset>
+
+      <fieldset>
+        <legend className="text-xs text-zinc-500 mb-1.5">Asset Class</legend>
+        <div className="flex gap-1.5">
+          {['all','crypto'].map(ac => (
+            <button key={ac} onClick={() => setFilters({ assetClass: ac })}
+              className={`px-2.5 py-1 rounded text-xs font-medium transition ${
+                filters.assetClass === ac ? 'bg-indigo-600 text-white' : 'bg-zinc-800 text-zinc-400 hover:bg-zinc-700'}`}>
+              {ac === 'all' ? 'All' : ac}
+            </button>
+          ))}
+        </div>
+      </fieldset>
+    </aside>
+  );
+}
+
+/* ── ScannerTable Component ─────────────────────────────── */
+const SymbolRowComponent = memo(function SymbolRowComponent({ row, onClick }) {
+  return (
+    <tr onClick={onClick} className="border-b border-zinc-800/50 hover:bg-zinc-800/40 cursor-pointer transition-colors">
+      <td className="px-3 py-2">
+        <div className="font-medium text-zinc-100">{row.symbol}</div>
+        <div className="text-[10px] text-zinc-600">{row.exchange}</div>
+      </td>
+      <td className="px-3 py-2 font-mono text-zinc-200">${fmtPrice(row.current_price)}</td>
+      <td className={`px-3 py-2 font-mono ${pctClass(row.price_change_pct_24h)}`}>
+        {row.price_change_pct_24h != null ? `${row.price_change_pct_24h >= 0 ? '+' : ''}${row.price_change_pct_24h.toFixed(2)}%` : '—'}
+      </td>
+      <td className="px-3 py-2 font-mono text-zinc-300">${fmt(row.volume_24h, 0)}</td>
+      <td className="px-3 py-2 font-mono text-zinc-300">${fmtPrice(row.high_24h)}</td>
+      <td className="px-3 py-2 font-mono text-zinc-300">${fmtPrice(row.low_24h)}</td>
+      <td className="px-3 py-2">
+        <Sparkline data={row.sparkline} positive={row.price_change_pct_24h != null ? row.price_change_pct_24h >= 0 : undefined} />
+      </td>
+    </tr>
+  );
+});
+
+function ScannerTable() {
+  const symbols = useStore(s => s.symbols);
+  const filters = useStore(s => s.filters);
+
+  const filtered = useMemo(() => {
+    return symbols.filter(row => {
+      if (row.volume_24h != null && row.volume_24h < filters.minVolume) return false;
+      if (filters.exchange !== 'all' && row.exchange !== filters.exchange) return false;
+      if (filters.assetClass !== 'all' && row.asset_class !== filters.assetClass) return false;
+      return true;
+    });
+  }, [symbols, filters]);
+
+  const [sortKey, setSortKey] = useState('volume_24h');
+  const [sortDesc, setSortDesc] = useState(true);
+
+  const sorted = useMemo(() => {
+    const copy = [...filtered];
+    copy.sort((a, b) => {
+      const av = a[sortKey] ?? -Infinity;
+      const bv = b[sortKey] ?? -Infinity;
+      return sortDesc ? (bv > av ? 1 : -1) : (av > bv ? 1 : -1);
+    });
+    return copy;
+  }, [filtered, sortKey, sortDesc]);
+
+  const toggleSort = (key) => {
+    if (sortKey === key) setSortDesc(d => !d);
+    else { setSortKey(key); setSortDesc(true); }
+  };
+  const sortIcon = (key) => sortKey === key ? (sortDesc ? ' ▼' : ' ▲') : '';
+
+  const openDetail = (row) => setStore({ selectedSymbol: row, detailOpen: true });
+
+  return (
+    <div className="overflow-x-auto">
+      <table className="w-full text-sm">
+        <thead className="sticky top-0 bg-zinc-900 z-10">
+          <tr className="text-zinc-500 text-xs uppercase tracking-wider">
+            {[
+              { key: 'symbol', label: 'Symbol' },
+              { key: 'current_price', label: 'Price' },
+              { key: 'price_change_pct_24h', label: '24h %' },
+              { key: 'volume_24h', label: 'Volume 24h' },
+              { key: 'high_24h', label: '24h High' },
+              { key: 'low_24h', label: '24h Low' },
+            ].map(({ key, label }) => (
+              <th key={key} onClick={() => toggleSort(key)}
+                className="px-3 py-2 text-left cursor-pointer hover:text-zinc-300 select-none">
+                {label}{sortIcon(key)}
+              </th>
+            ))}
+            <th className="px-3 py-2 text-left">Spark</th>
+          </tr>
+        </thead>
+        <tbody>
+          {sorted.map(row => (
+            <SymbolRowComponent key={row.symbol} row={row} onClick={() => openDetail(row)} />
+          ))}
+          {sorted.length === 0 && (
+            <tr><td colSpan={7} className="text-center py-12 text-zinc-600">Loading market data...</td></tr>
+          )}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+/* ── Heatmap Component ──────────────────────────────────── */
+function scoreColor(pct) {
+  if (pct == null) return 'rgba(63,63,70,0.5)';
+  if (pct >= 10) return 'rgba(34,197,94,0.6)';
+  if (pct >= 5) return 'rgba(34,197,94,0.35)';
+  if (pct >= 2) return 'rgba(245,158,11,0.3)';
+  if (pct >= 0) return 'rgba(148,163,184,0.15)';
+  if (pct >= -2) return 'rgba(148,163,184,0.1)';
+  if (pct >= -5) return 'rgba(239,68,68,0.25)';
+  return 'rgba(239,68,68,0.5)';
+}
+
+const HeatmapTile = memo(function HeatmapTile({ row, isVolatile, onClick }) {
+  const changePct = row.price_change_pct_24h;
+  const bgColor = scoreColor(changePct);
+  const borderColor = isVolatile ? 'rgba(239,68,68,0.35)' : 'rgba(63,63,70,0.3)';
+  return (
+    <button data-symbol={row.symbol} onClick={onClick}
+      className={`relative rounded-lg p-2 text-center cursor-pointer transition-all duration-200 ease-out hover:scale-110 hover:z-20 active:scale-100 ${isVolatile ? 'volatile-tile' : ''}`}
+      style={{ backgroundColor: bgColor, border: `1px solid ${borderColor}` }}>
+      {isVolatile && <span className="absolute -top-1 -right-1 w-2 h-2 rounded-full bg-rose-500 volatile-dot" />}
+      <div className="text-[11px] font-bold truncate text-zinc-200">
+        {row.symbol.replace('/USDT', '').replace('/USD', '')}
+      </div>
+      <div className="text-[10px] font-mono font-semibold"
+        style={{ color: changePct != null && changePct >= 0 ? '#4ade80' : '#f87171' }}>
+        {changePct != null ? `${changePct >= 0 ? '+' : ''}${changePct.toFixed(1)}%` : '—'}
+      </div>
+      <div className="text-[9px] text-zinc-500 mt-0.5">${fmt(row.volume_24h, 0)}</div>
+    </button>
+  );
+});
+
+function Heatmap() {
+  const symbols = useStore(s => s.symbols);
+  const filters = useStore(s => s.filters);
+
+  const filtered = useMemo(() => {
+    return symbols.filter(row => {
+      if (row.volume_24h != null && row.volume_24h < filters.minVolume) return false;
+      return true;
+    });
+  }, [symbols, filters]);
+
+  const tiles = useMemo(() =>
+    [...filtered].sort((a, b) => Math.abs(b.price_change_pct_24h ?? 0) - Math.abs(a.price_change_pct_24h ?? 0)).slice(0, 100),
+    [filtered]
+  );
+
+  const volatileSet = useMemo(() =>
+    new Set(tiles.filter(t => t.price_change_pct_24h != null && Math.abs(t.price_change_pct_24h) >= 5).map(c => c.symbol)),
+    [tiles]
+  );
+
+  const [hovered, setHovered] = useState(null);
+  const containerRef = useRef(null);
+
+  const openDetail = (row) => setStore({ selectedSymbol: row, detailOpen: true });
+
+  return (
+    <div ref={containerRef} className="p-4 relative">
+      <div className="flex items-center justify-between mb-3">
+        <div className="flex items-center gap-3">
+          <h3 className="text-xs font-semibold text-zinc-500 uppercase tracking-wider">🔥 Heatmap — Top {tiles.length}</h3>
+          {volatileSet.size > 0 && (
+            <span className="text-[10px] px-2 py-0.5 rounded-full bg-rose-500/20 text-rose-400 border border-rose-500/30 anim-pulse">
+              {volatileSet.size} volatile
+            </span>
+          )}
+        </div>
+        <div className="flex items-center gap-3 text-[10px] text-zinc-600">
+          <span className="flex items-center gap-1"><span className="w-3 h-3 rounded-sm" style={{backgroundColor:'rgba(239,68,68,0.5)'}} />Bearish</span>
+          <span className="flex items-center gap-1"><span className="w-3 h-3 rounded-sm" style={{backgroundColor:'rgba(148,163,184,0.15)'}} />Neutral</span>
+          <span className="flex items-center gap-1"><span className="w-3 h-3 rounded-sm" style={{backgroundColor:'rgba(34,197,94,0.6)'}} />Bullish</span>
+        </div>
+      </div>
+      <div className="grid grid-cols-[repeat(auto-fill,minmax(88px,1fr))] gap-1.5">
+        {tiles.map(row => (
+          <HeatmapTile key={row.symbol} row={row} isVolatile={volatileSet.has(row.symbol)}
+            onClick={() => openDetail(row)} />
+        ))}
+      </div>
+    </div>
+  );
+}
+
+/* ── Detail Modal ───────────────────────────────────────── */
+function DetailModal() {
+  const detailOpen = useStore(s => s.detailOpen);
+  const selectedSymbol = useStore(s => s.selectedSymbol);
+  const close = () => setStore({ detailOpen: false, selectedSymbol: null });
+
+  const [snapshots, setSnapshots] = useState([]);
+  const [loading, setLoading] = useState(false);
+
+  useEffect(() => {
+    if (!detailOpen || !selectedSymbol) return;
+    let cancelled = false;
+    setLoading(true);
+    fetchKlines(selectedSymbol.raw_symbol, '1h', 48).then(prices => {
+      if (!cancelled) setSnapshots(prices);
+    }).catch(() => {
+      if (!cancelled && selectedSymbol.sparkline?.length) setSnapshots(selectedSymbol.sparkline);
+    }).finally(() => { if (!cancelled) setLoading(false); });
+    return () => { cancelled = true; };
+  }, [detailOpen, selectedSymbol]);
+
+  useEffect(() => {
+    if (!detailOpen) return;
+    const handler = e => { if (e.key === 'Escape') close(); };
+    document.addEventListener('keydown', handler);
+    return () => document.removeEventListener('keydown', handler);
+  }, [detailOpen]);
+
+  if (!detailOpen || !selectedSymbol) return null;
+  const row = selectedSymbol;
+
+  // Render chart as SVG
+  const chartW = 580, chartH = 200;
+  let chartSvg = null;
+  if (snapshots.length >= 2) {
+    const min = Math.min(...snapshots);
+    const max = Math.max(...snapshots);
+    const range = max - min || 1;
+    const pts = snapshots.map((v, i) => {
+      const x = (i / (snapshots.length - 1)) * chartW;
+      const y = chartH - ((v - min) / range) * (chartH - 20) - 10;
+      return `${x},${y}`;
+    });
+    const areaPath = `M0,${chartH} L${pts.map(p => p).join(' L')} L${chartW},${chartH} Z`;
+    chartSvg = (
+      <svg width="100%" height={chartH} viewBox={`0 0 ${chartW} ${chartH}`} preserveAspectRatio="none">
+        <defs>
+          <linearGradient id="chartGrad" x1="0" y1="0" x2="0" y2="1">
+            <stop offset="0%" stopColor="rgba(59,130,246,0.3)" />
+            <stop offset="100%" stopColor="rgba(59,130,246,0.02)" />
+          </linearGradient>
+        </defs>
+        <path d={areaPath} fill="url(#chartGrad)" />
+        <polyline fill="none" stroke="#3b82f6" strokeWidth="2" points={pts.join(' ')} />
+      </svg>
+    );
+  }
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm">
+      <div className="absolute inset-0" onClick={close} />
+      <div className="relative z-10 bg-zinc-900 border border-zinc-700 rounded-lg shadow-xl w-full max-w-2xl mx-4 animate-in">
+        <div className="flex items-center justify-between p-4 border-b border-zinc-800">
+          <div>
+            <span className="text-lg font-bold text-zinc-100">{row.symbol}</span>
+            <span className="ml-2 text-sm text-zinc-500">{row.exchange}</span>
+          </div>
+          <button onClick={close} className="text-zinc-500 hover:text-zinc-200 text-xl leading-none px-2">✕</button>
+        </div>
+        <div className="p-4">
+          {loading ? (
+            <div className="h-[200px] flex items-center justify-center text-zinc-600 text-sm">Loading chart…</div>
+          ) : snapshots.length === 0 ? (
+            <div className="h-[200px] flex items-center justify-center text-zinc-600 text-sm">No chart data</div>
+          ) : (
+            <div className="w-full bg-zinc-950 rounded-lg p-2">{chartSvg}</div>
+          )}
+        </div>
+        <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 p-4 border-t border-zinc-800">
+          <MetricBox label="Price" value={`$${fmtPrice(row.current_price)}`} />
+          <MetricBox label="24h Change"
+            value={row.price_change_pct_24h != null ? `${row.price_change_pct_24h >= 0 ? '+' : ''}${row.price_change_pct_24h.toFixed(2)}%` : '—'}
+            color={row.price_change_pct_24h >= 0 ? 'text-green-400' : 'text-red-400'} />
+          <MetricBox label="24h High" value={`$${fmtPrice(row.high_24h)}`} />
+          <MetricBox label="24h Low" value={`$${fmtPrice(row.low_24h)}`} />
+          <MetricBox label="Volume 24h" value={`$${fmt(row.volume_24h, 0)}`} />
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function MetricBox({ label, value, color }) {
+  return (
+    <div>
+      <div className="text-[10px] text-zinc-500 uppercase">{label}</div>
+      <div className={`text-sm font-mono font-semibold ${color || 'text-zinc-200'}`}>{value}</div>
+    </div>
+  );
+}
+
+/* ── Alerts Feed (Binance WebSocket) ────────────────────── */
+function AlertsFeed() {
+  const symbols = useStore(s => s.symbols);
+  const [alerts, setAlerts] = useState([]);
+  const scrollRef = useRef(null);
+
+  // Generate alerts from price data
+  useEffect(() => {
+    if (symbols.length === 0) return;
+    const newAlerts = [];
+    for (const s of symbols) {
+      if (s.price_change_pct_24h != null && Math.abs(s.price_change_pct_24h) >= 8) {
+        newAlerts.push({
+          id: `${s.symbol}-big-move`,
+          symbol: s.symbol,
+          rule: s.price_change_pct_24h >= 0 ? 'price_surge' : 'price_drop',
+          message: `${s.price_change_pct_24h >= 0 ? '🚀' : '📉'} ${Math.abs(s.price_change_pct_24h).toFixed(1)}% in 24h`,
+          ts: new Date().toISOString(),
+        });
+      }
+    }
+    newAlerts.sort((a, b) => {
+      const av = symbols.find(s => s.symbol === a.symbol)?.price_change_pct_24h ?? 0;
+      const bv = symbols.find(s => s.symbol === b.symbol)?.price_change_pct_24h ?? 0;
+      return Math.abs(bv) - Math.abs(av);
+    });
+    setAlerts(newAlerts.slice(0, 50));
+  }, [symbols]);
+
+  useEffect(() => {
+    if (scrollRef.current) scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
+  }, [alerts.length]);
+
+  const RULE_COLORS = { price_surge: 'text-emerald-400', price_drop: 'text-red-400' };
+
+  const exportCsv = () => {
+    const header = 'symbol,rule,message\n';
+    const rows = alerts.map(a => `${a.symbol},${a.rule},"${a.message}"`).join('\n');
+    const blob = new Blob([header + rows], { type: 'text/csv' });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = `alerts_${Date.now()}.csv`;
+    link.click();
+    URL.revokeObjectURL(url);
+  };
+
+  return (
+    <div className="flex flex-col h-full">
+      <div className="flex items-center justify-between p-3 border-b border-zinc-800">
+        <h3 className="text-xs font-semibold text-zinc-500 uppercase tracking-wider">
+          Alerts <span className="ml-1.5 text-zinc-600">({alerts.length})</span>
+        </h3>
+        <button onClick={exportCsv} disabled={alerts.length === 0}
+          className="flex items-center gap-1.5 text-[11px] px-2.5 py-1 rounded-md bg-indigo-600/20 text-indigo-300 border border-indigo-500/30 hover:bg-indigo-600/30 disabled:opacity-30 transition-all font-medium">
+          <svg className="w-3 h-3" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+            <path strokeLinecap="round" strokeLinejoin="round" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" />
+          </svg>
+          CSV
+        </button>
+      </div>
+      <div ref={scrollRef} className="flex-1 overflow-y-auto p-2 space-y-1">
+        {alerts.length === 0 && <div className="text-zinc-600 text-xs text-center mt-8">No alerts yet</div>}
+        {alerts.map((alert, i) => (
+          <div key={alert.id + i} className="flex items-start gap-2 p-2 rounded hover:bg-zinc-800/60 transition-colors">
+            <span className="text-sm leading-none mt-0.5">{alert.rule === 'price_surge' ? '📈' : '📉'}</span>
+            <div className="flex-1 min-w-0">
+              <div className="flex items-center gap-1.5">
+                <span className="text-xs font-bold text-zinc-200">{alert.symbol}</span>
+                <span className={`text-[10px] font-mono ${RULE_COLORS[alert.rule] || 'text-zinc-400'}`}>{alert.rule}</span>
+              </div>
+              <div className="text-[10px] text-zinc-500 truncate mt-0.5">{alert.message}</div>
+            </div>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+/* ── Binance WebSocket for Real-Time Prices ─────────────── */
+function useBinanceWebSocket() {
+  const symbols = useStore(s => s.symbols);
+  const [connected, setConnected] = useState(false);
+  const wsRef = useRef(null);
+
+  useEffect(() => {
+    if (symbols.length === 0) return;
+
+    // Connect to Binance WebSocket for all mini tickers
+    const ws = new WebSocket('wss://stream.binance.com:9443/ws/!miniTicker@arr');
+    wsRef.current = ws;
+
+    ws.onopen = () => setConnected(true);
+    ws.onclose = () => {
+      setConnected(false);
+      // Reconnect after 5s
+      setTimeout(() => {
+        if (wsRef.current === ws) useBinanceWebSocket();
+      }, 5000);
+    };
+    ws.onerror = () => ws.close();
+
+    let buffer = [];
+    let timer = null;
+
+    ws.onmessage = (ev) => {
+      try {
+        const tickers = JSON.parse(ev.data);
+        for (const t of tickers) {
+          if (t.s && t.s.endsWith('USDT')) {
+            buffer.push({
+              raw_symbol: t.s,
+              symbol: t.s.replace('USDT', '/USDT'),
+              current_price: parseFloat(t.c),
+              volume_24h: parseFloat(t.q),
+            });
+          }
+        }
+      } catch {}
+
+      if (!timer) {
+        timer = setTimeout(() => {
+          const updates = buffer;
+          buffer = [];
+          timer = null;
+          if (updates.length === 0) return;
+
+          setStore(s => {
+            const map = new Map(s.symbols.map(r => [r.symbol, r]));
+            let changed = false;
+            for (const u of updates) {
+              const existing = map.get(u.symbol);
+              if (existing) {
+                map.set(u.symbol, { ...existing, current_price: u.current_price, volume_24h: u.volume_24h });
+                changed = true;
+              }
+            }
+            return changed ? { symbols: Array.from(map.values()) } : {};
+          });
+        }, 1000);
+      }
+    };
+
+    return () => {
+      ws.close();
+      wsRef.current = null;
+    };
+  }, [symbols.length > 0]); // Only reconnect when we first get symbols
+
+  return connected;
+}
+
+/* ── Main App Component ─────────────────────────────────── */
+function App() {
+  const [tab, setTab] = useState('table');
+  const [alertsOpen, setAlertsOpen] = useState(false);
+  const [refreshing, setRefreshing] = useState(false);
+  const [lastUpdated, setLastUpdated] = useState(null);
+  const [error, setError] = useState(null);
+  const alerts = useStore(s => s.symbols).filter(s => s.price_change_pct_24h != null && Math.abs(s.price_change_pct_24h) >= 8);
+
+  const wsConnected = useBinanceWebSocket();
+
+  // Load data function
+  const loadData = useCallback(async () => {
+    setRefreshing(true);
+    setError(null);
+    try {
+      const rows = await fetchTicker24h();
+      // Fetch sparklines for top 30 coins in parallel
+      const top30 = rows.slice(0, 30);
+      const sparkPromises = top30.map(r =>
+        fetchKlines(r.raw_symbol, '1h', 24).then(data => ({ symbol: r.symbol, data })).catch(() => ({ symbol: r.symbol, data: [] }))
+      );
+      const sparkResults = await Promise.all(sparkPromises);
+      const sparkMap = new Map(sparkResults.map(s => [s.symbol, s.data]));
+
+      const enriched = rows.map(r => ({
+        ...r,
+        sparkline: sparkMap.get(r.symbol) || r.sparkline,
+      }));
+
+      setStore({ symbols: enriched });
+      setLastUpdated(new Date());
+    } catch (err) {
+      setError(err.message);
+      console.error('Failed to load data:', err);
+    } finally {
+      setRefreshing(false);
+    }
+  }, []);
+
+  // Initial load
+  useEffect(() => { loadData(); }, []);
+
+  // Auto-refresh every 60s
+  useEffect(() => {
+    const interval = setInterval(loadData, 60000);
+    return () => clearInterval(interval);
+  }, [loadData]);
+
+  return (
+    <div className="flex h-screen overflow-hidden">
+      {/* Left panel — filters */}
+      <FilterPanel />
+
+      {/* Center — scanner content */}
+      <main className="flex-1 flex flex-col min-w-0 overflow-hidden">
+        {/* Top bar */}
+        <header className="flex items-center justify-between px-4 py-2.5 border-b border-zinc-800 bg-zinc-900/80 backdrop-blur-sm">
+          <div className="flex items-center gap-3">
+            <h1 className="text-sm font-bold text-zinc-100 tracking-tight">
+              <span className="text-indigo-400">⚡</span> Crypto Market Scanner
+            </h1>
+            <div className={`w-2 h-2 rounded-full ${wsConnected ? 'bg-emerald-500 anim-pulse' : 'bg-red-500'}`}
+              title={wsConnected ? 'WebSocket connected' : 'WebSocket disconnected'} />
+            {lastUpdated && (
+              <span className="text-[10px] text-zinc-600 hidden sm:inline">
+                Updated {lastUpdated.toLocaleTimeString()}
+              </span>
+            )}
+          </div>
+
+          <div className="flex items-center gap-2">
+            {/* Refresh button */}
+            <button onClick={loadData} disabled={refreshing}
+              className="flex items-center gap-1.5 text-xs px-3 py-1.5 rounded-md bg-indigo-600/20 text-indigo-300 border border-indigo-500/30 hover:bg-indigo-600/30 hover:border-indigo-500/50 hover:text-indigo-200 disabled:opacity-50 disabled:cursor-not-allowed transition-all duration-200 active:scale-95"
+              title="Fetch live prices from Binance">
+              <svg className={`w-3.5 h-3.5 ${refreshing ? 'anim-spin' : ''}`}
+                fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                <path strokeLinecap="round" strokeLinejoin="round"
+                  d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
+              </svg>
+              {refreshing ? 'Refreshing…' : 'Refresh'}
+            </button>
+
+            {/* View toggle */}
+            <div className="flex items-center gap-0.5 bg-zinc-800/80 rounded-lg p-0.5 border border-zinc-700/50">
+              <button onClick={() => setTab('table')}
+                className={`text-xs px-3 py-1.5 rounded-md transition-all duration-200 ${
+                  tab === 'table' ? 'bg-zinc-600/80 text-zinc-100 shadow-sm' : 'text-zinc-500 hover:text-zinc-300'}`}>
+                📊 Table
+              </button>
+              <button onClick={() => setTab('heatmap')}
+                className={`text-xs px-3 py-1.5 rounded-md transition-all duration-200 ${
+                  tab === 'heatmap' ? 'bg-zinc-600/80 text-zinc-100 shadow-sm' : 'text-zinc-500 hover:text-zinc-300'}`}>
+                🔥 Heatmap
+              </button>
+            </div>
+
+            {/* Mobile alerts toggle */}
+            <button onClick={() => setAlertsOpen(v => !v)}
+              className="lg:hidden relative text-zinc-400 hover:text-zinc-200 text-sm">
+              🔔
+              {alerts.length > 0 && (
+                <span className="absolute -top-1 -right-2 text-[9px] bg-rose-600 text-white rounded-full px-1 min-w-[14px] text-center">
+                  {alerts.length > 99 ? '99+' : alerts.length}
+                </span>
+              )}
+            </button>
+          </div>
+        </header>
+
+        {error && (
+          <div className="mx-4 mt-2 flex items-center gap-2 p-3 rounded-lg bg-red-500/10 border border-red-500/20 text-red-400 text-xs">
+            ⚠️ {error} — <button onClick={loadData} className="underline hover:text-red-300">Retry</button>
+          </div>
+        )}
+
+        {/* Content area */}
+        <div className="flex-1 overflow-y-auto">
+          {tab === 'table' ? <ScannerTable /> : <Heatmap />}
+        </div>
+      </main>
+
+      {/* Right panel — alerts feed */}
+      <aside className={`w-72 border-l border-zinc-800 bg-zinc-900/50 flex-shrink-0
+          max-lg:fixed max-lg:inset-y-0 max-lg:right-0 max-lg:z-40 max-lg:shadow-xl
+          max-lg:transition-transform max-lg:duration-200
+          ${alertsOpen ? 'max-lg:translate-x-0' : 'max-lg:translate-x-full'}`}>
+        <AlertsFeed />
+      </aside>
+
+      {alertsOpen && (
+        <div className="fixed inset-0 bg-black/40 z-30 lg:hidden" onClick={() => setAlertsOpen(false)} />
+      )}
+
+      <DetailModal />
+    </div>
+  );
+}
+
+/* ── Mount ──────────────────────────────────────────────── */
+const root = ReactDOM.createRoot(document.getElementById('root'));
+root.render(React.createElement(React.StrictMode, null, React.createElement(App)));
+</script>
+</body>
+</html>

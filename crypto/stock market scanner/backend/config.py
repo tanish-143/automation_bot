@@ -21,10 +21,8 @@ class Settings(BaseSettings):
     # ── Redis (Celery broker + result backend + cache) ──
     redis_url: str = "redis://localhost:6379/0"
 
-    # ── CoinGecko REST API (Demo key) ──
-    coingecko_rest_base: str = "https://api.coingecko.com/api/v3"
-    coingecko_api_key: str = ""  # Demo API key (x-cg-demo-api-key header)
-    coingecko_rate_limit_per_min: int = 30  # demo tier: ~30 calls/min
+    # ── Binance REST API ──
+    binance_rest_base: str = "https://api.binance.com"
 
     # ── CoinCap WebSocket (free, no key required) ──
     coincap_ws_url: str = "wss://ws.coincap.io/prices?assets=ALL"
@@ -43,6 +41,8 @@ class Settings(BaseSettings):
     slack_webhook_url: str = ""
     telegram_bot_token: str = ""
     telegram_default_chat_id: str = ""
+    telegram_summary_interval_minutes: int = 60
+    telegram_top_n: int = 10
     smtp_host: str = ""
     smtp_port: int = 587
     smtp_user: str = ""
@@ -52,6 +52,13 @@ class Settings(BaseSettings):
     # ── Groq AI ──
     groq_api_key: str = ""
     groq_model: str = "llama-3.3-70b-versatile"
+
+    # ── Alerts CSV Export ──
+    alerts_export_dir: str = "output/alerts"
+
+    # ── Chandelier Exit ──
+    ce_atr_period: int = 22
+    ce_atr_mult: float = 3.0
 
     # ── API ──
     api_host: str = "0.0.0.0"

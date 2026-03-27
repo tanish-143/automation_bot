@@ -11,11 +11,11 @@ export function useFilteredSymbols(): SymbolRow[] {
       // Min 24h volume
       if (row.volume_24h != null && row.volume_24h < filters.minVolume) return false;
 
-      // Volume ratio threshold (skip null — CoinGecko data won't have it)
-      if (row.volume_ratio != null && row.volume_ratio < filters.volumeRatioMin) return false;
+      // Volume ratio threshold (treat null/0 as unavailable rather than filtering the row out)
+      if (row.volume_ratio != null && row.volume_ratio > 0 && row.volume_ratio < filters.volumeRatioMin) return false;
 
-      // Volatility percentile threshold (skip null)
-      if (row.volatility_percentile != null && row.volatility_percentile < filters.volatilityPctMin)
+      // Volatility percentile threshold (treat null/0 as unavailable rather than filtering the row out)
+      if (row.volatility_percentile != null && row.volatility_percentile > 0 && row.volatility_percentile < filters.volatilityPctMin)
         return false;
 
       // Exchange

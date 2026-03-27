@@ -10,17 +10,16 @@ const SESSIONS: { value: Session; label: string }[] = [
   { value: 'us', label: '🌎 US' },
 ];
 
-const EXCHANGES = ['all', 'binance', 'coinbase', 'coingecko', 'nasdaq', 'nyse'];
-
 const DEFAULT_FILTERS = {
   session: 'all' as Session,
   timeframe: '1h' as const,
   volumeRatioMin: 1,
-  volatilityPctMin: 50,
+  volatilityPctMin: 0,
   minVolume: 10_000,
   exchange: 'all',
   assetClass: 'all' as AssetClass | 'all',
 };
+const EXCHANGES = ['all', 'binance', 'coinbase', 'nasdaq', 'nyse'];
 
 export function FilterPanel() {
   const filters = useStore((s) => s.filters);
@@ -168,13 +167,13 @@ export function FilterPanel() {
         </legend>
         <input
           type="range"
-          min={50} max={99} step={1}
+          min={0} max={99} step={1}
           value={filters.volatilityPctMin}
           onChange={(e) => setFilters({ volatilityPctMin: +e.target.value })}
           className="w-full accent-indigo-500"
         />
         <div className="flex justify-between text-[10px] text-zinc-600">
-          <span>50th</span><span>99th</span>
+          <span>0</span><span>99th</span>
         </div>
       </fieldset>
 

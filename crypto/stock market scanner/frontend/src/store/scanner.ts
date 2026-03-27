@@ -47,7 +47,7 @@ const DEFAULT_FILTERS: FilterState = {
   session: 'all',
   timeframe: '1h',
   volumeRatioMin: 1,
-  volatilityPctMin: 50,
+  volatilityPctMin: 0,
   minVolume: 10_000,
   exchange: 'all',
   assetClass: 'all',
