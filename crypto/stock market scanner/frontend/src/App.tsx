@@ -16,6 +16,7 @@ import { Heatmap } from './components/heatmap/Heatmap';
 import { AlertsFeed } from './components/alerts/AlertsFeed';
 import { DetailModal } from './components/detail/DetailModal';
 import { AiTradeSetup } from './components/ai/AiTradeSetup';
+import { TelegramSignal } from './components/telegram/TelegramSignal';
 
 function App() {
   const setSymbols = useStore((s) => s.setSymbols);
@@ -124,6 +125,9 @@ function App() {
               <span className="text-sm">🤖</span>
               AI Setup
             </button>
+
+            {/* Telegram Signal button */}
+            <TelegramSignal />
 
             {/* Refresh button */}
             <button

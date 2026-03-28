@@ -49,4 +49,14 @@ export const api = {
     if (!res.ok) throw new Error(`API ${res.status}`);
     return res.json();
   },
+
+  telegramSignal: async (category: 'meme' | 'regular' | 'ai') => {
+    const res = await fetch(`${API}/scan/telegram-signal`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ category }),
+    });
+    if (!res.ok) throw new Error(`API ${res.status}`);
+    return res.json() as Promise<{ status: string; category: string; coins: number; message: string }>;
+  },
 };

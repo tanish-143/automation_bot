@@ -12,6 +12,7 @@ Endpoints:
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 from datetime import datetime, timezone
@@ -19,11 +20,14 @@ from enum import Enum
 
 from fastapi import Depends, FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
+import httpx
 from pydantic import BaseModel, field_validator
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from alert_dispatcher import AlertDispatcher
 from binance_client import fetch_candles_for_app_symbols_async, fetch_ticker_24h_async
+from crypto.chandelier_exit import compute_ce_for_symbols
 from config import settings
 from db import get_db
 from logging_config import setup_logging
@@ -408,3 +412,171 @@ async def get_ai_analysis(db: AsyncSession = Depends(get_db)):
     analysis = await analyze_trade_setup(prices, ce_data if ce_data else None)
 
     return {"analysis": analysis, "coin_count": len(prices)}
+
+
+# ─── Telegram Signal by Coin Category ────────────────────────────────────────
+
+COIN_CATEGORIES: dict[str, list[str]] = {
+    "meme": [
+        "DOGEUSDT", "SHIBUSDT", "PEPEUSDT", "FLOKIUSDT", "BONKUSDT",
+        "WIFUSDT", "MEMEUSDT", "BOMEUSDT", "TURBOUSDT", "PEOPLEUSDT",
+    ],
+    "regular": [
+        "BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT", "XRPUSDT",
+        "ADAUSDT", "AVAXUSDT", "DOTUSDT", "LINKUSDT", "LTCUSDT",
+        "MATICUSDT", "UNIUSDT", "ATOMUSDT", "FILUSDT",
+    ],
+    "ai": [
+        "FETUSDT", "RENDERUSDT", "TAOUSDT", "GRTUSDT", "NEARUSDT",
+        "INJUSDT", "THETAUSDT", "ARUSDT", "WLDUSDT", "RLCUSDT",
+    ],
+}
+
+CATEGORY_EMOJI = {"meme": "🐸", "regular": "💎", "ai": "🤖"}
+CATEGORY_LABEL = {"meme": "Meme Coins", "regular": "Regular Coins", "ai": "AI Coins"}
+
+
+class TelegramSignalRequest(BaseModel):
+    category: str
+
+    @field_validator("category")
+    @classmethod
+    def validate_category(cls, v: str) -> str:
+        allowed = set(COIN_CATEGORIES.keys())
+        if v not in allowed:
+            raise ValueError(f"category must be one of {allowed}")
+        return v
+
+
+@app.post("/scan/telegram-signal")
+async def send_telegram_signal(body: TelegramSignalRequest):
+    """
+    Fetch live Binance data for the chosen coin category
+    and send a formatted signal with entry, stop-loss, and target profit to Telegram.
+    """
+    if not settings.telegram_bot_token or not settings.telegram_default_chat_id:
+        raise HTTPException(503, "Telegram not configured")
+
+    category = body.category
+    symbols = COIN_CATEGORIES[category]
+    emoji = CATEGORY_EMOJI[category]
+    label = CATEGORY_LABEL[category]
+
+
+    # Fetch 24h tickers for the category symbols
+    try:
+        async with httpx.AsyncClient(
+            base_url=settings.binance_rest_base, timeout=20.0
+        ) as client:
+            resp = await client.get(
+                "/api/v3/ticker/24hr",
+                params={"symbols": json.dumps(symbols, separators=(",", ":"))},
+            )
+            resp.raise_for_status()
+            raw_tickers = resp.json()
+    except Exception as e:
+        raise HTTPException(502, f"Binance fetch failed: {e}")
+
+    if isinstance(raw_tickers, dict):
+        raw_tickers = [raw_tickers]
+
+    # Sort by absolute price change
+    tickers = sorted(
+        raw_tickers,
+        key=lambda t: abs(float(t.get("priceChangePercent") or 0)),
+        reverse=True,
+    )
+
+    now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    lines = [
+        f"{emoji} <b>{label} Signal</b>",
+        f"<i>{now_str}</i>",
+        "",
+    ]
+
+    for i, t in enumerate(tickers, 1):
+        sym = t.get("symbol", "")
+        price = float(t.get("lastPrice") or 0)
+        change = float(t.get("priceChangePercent") or 0)
+        high = float(t.get("highPrice") or 0)
+        low = float(t.get("lowPrice") or 0)
+        vol = float(t.get("quoteVolume") or 0)
+
+        if price <= 0:
+            continue
+
+        # ── Trading rules based on 24h range & momentum ──
+        range_24h = high - low if high > low else price * 0.02
+        is_long = change >= 0
+        direction = "LONG 🟢" if is_long else "SHORT 🔴"
+
+        if is_long:
+            # Pullback entry near support, SL below 24h low, TP at range extension
+            entry = price - (range_24h * 0.15)          # enter on ~15% pullback
+            stop_loss = low - (range_24h * 0.10)         # SL 10% below 24h low
+            tp1 = price + (range_24h * 0.50)             # TP1: 50% range extension
+            tp2 = price + (range_24h * 1.00)             # TP2: full range extension
+            tp3 = high + (range_24h * 0.50)              # TP3: breakout target
+        else:
+            # Short entry near resistance, SL above 24h high, TP at range drop
+            entry = price + (range_24h * 0.15)
+            stop_loss = high + (range_24h * 0.10)
+            tp1 = price - (range_24h * 0.50)
+            tp2 = price - (range_24h * 1.00)
+            tp3 = low - (range_24h * 0.50)
+
+        # Risk/reward ratio
+        risk = abs(entry - stop_loss) if abs(entry - stop_loss) > 0 else 1
+        rr1 = abs(tp1 - entry) / risk
+        vol_m = vol / 1_000_000
+
+        def fmt(v: float) -> str:
+            if v >= 1000:
+                return f"{v:.2f}"
+            if v >= 1:
+                return f"{v:.4f}"
+            if v >= 0.01:
+                return f"{v:.6f}"
+            return f"{v:.8f}"
+
+        lines.append(f"{'━' * 28}")
+        lines.append(f"{i}. <b>{sym}</b>  {direction}")
+        lines.append(f"   💰 Price: <code>{fmt(price)}</code>  ({change:+.2f}%)")
+        lines.append(f"   📊 24h H/L: <code>{fmt(high)}</code> / <code>{fmt(low)}</code>")
+        lines.append(f"   📈 Vol: <code>${vol_m:.1f}M</code>")
+        lines.append("")
+        lines.append(f"   ▸ Entry:     <code>{fmt(entry)}</code>")
+        lines.append(f"   ▸ Stop Loss: <code>{fmt(stop_loss)}</code>")
+        lines.append(f"   ▸ TP1:       <code>{fmt(tp1)}</code>")
+        lines.append(f"   ▸ TP2:       <code>{fmt(tp2)}</code>")
+        lines.append(f"   ▸ TP3:       <code>{fmt(tp3)}</code>")
+        lines.append(f"   ▸ R:R →      <code>1:{rr1:.1f}</code>")
+        lines.append("")
+
+    lines.append(f"{'━' * 28}")
+    lines.append("⚠️ <i>DYOR — Not financial advice</i>")
+
+    text_msg = "\n".join(lines)
+
+    # Send via Telegram Bot API
+    url = f"https://api.telegram.org/bot{settings.telegram_bot_token}/sendMessage"
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            tg_resp = await client.post(url, json={
+                "chat_id": settings.telegram_default_chat_id,
+                "text": text_msg,
+                "parse_mode": "HTML",
+                "disable_web_page_preview": True,
+            })
+        if tg_resp.status_code >= 400:
+            logger.warning("Telegram signal %d: %s", tg_resp.status_code, tg_resp.text[:200])
+            raise HTTPException(502, "Telegram delivery failed")
+    except httpx.HTTPError as e:
+        raise HTTPException(502, f"Telegram request failed: {e}")
+
+    return {
+        "status": "sent",
+        "category": category,
+        "coins": len(tickers),
+        "message": f"{label} signal sent to Telegram",
+    }
